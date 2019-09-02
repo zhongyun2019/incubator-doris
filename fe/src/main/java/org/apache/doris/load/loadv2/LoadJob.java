@@ -45,7 +45,10 @@ import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.mysql.privilege.PaloPrivilege;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.Coordinator;
+import org.apache.doris.qe.QeProcessorImpl;
 import org.apache.doris.thrift.TEtlState;
+import org.apache.doris.thrift.TUniqueId;
 import org.apache.doris.transaction.AbstractTxnStateChangeCallback;
 import org.apache.doris.transaction.BeginTransactionException;
 import org.apache.doris.transaction.TransactionException;
@@ -55,6 +58,7 @@ import com.google.common.base.Joiner;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+import com.google.gson.Gson;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -65,6 +69,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public abstract class LoadJob extends AbstractTxnStateChangeCallback implements LoadTaskCallback, Writable {
@@ -86,9 +91,10 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
 
     // optional properties
     // timeout second need to be reset in constructor of subclass
-    protected long timeoutSecond = Config.pull_load_task_default_timeout_second;
+    protected long timeoutSecond = Config.broker_load_default_timeout_second;
     protected long execMemLimit = 2147483648L; // 2GB;
     protected double maxFilterRatio = 0;
+    @Deprecated
     protected boolean deleteFlag = false;
     protected boolean strictMode = true;
 
@@ -115,6 +121,35 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
     private boolean isJobTypeRead = false;
 
     protected ReentrantReadWriteLock lock = new ReentrantReadWriteLock(true);
+
+    // this request id is only used for checking if a load begin request is a duplicate request.
+    protected TUniqueId requestId;
+
+    protected LoadStatistic loadStatistic = new LoadStatistic();
+
+    public static class LoadStatistic {
+        // number of rows processed on BE, this number will be updated periodically by query report.
+        // A load job may has several load tasks, so the map key is load task's plan load id.
+        public Map<TUniqueId, AtomicLong> numLoadedRowsMap = Maps.newConcurrentMap();
+        // number of file to be loaded
+        public int fileNum = 0;
+        public long totalFileSizeB = 0;
+        
+        public String toJson() {
+            long total = 0;
+            for (AtomicLong atomicLong : numLoadedRowsMap.values()) {
+                total += atomicLong.get();
+            }
+
+            Map<String, Object> details = Maps.newHashMap();
+            details.put("LoadedRows", total);
+            details.put("FileNumber", fileNum);
+            details.put("FileSize", totalFileSizeB);
+            details.put("TaskNumber", numLoadedRowsMap.size());
+            Gson gson = new Gson();
+            return gson.toJson(details);
+        }
+    }
 
     // only for log replay
     public LoadJob() {
@@ -187,6 +222,22 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
         return transactionId;
     }
 
+    public void updateLoadedRows(TUniqueId loadId, long loadedRows) {
+        AtomicLong atomicLong = loadStatistic.numLoadedRowsMap.get(loadId);
+        if (atomicLong != null) {
+            atomicLong.set(loadedRows);
+        }
+    }
+
+    public void setLoadFileInfo(int fileNum, long fileSize) {
+        this.loadStatistic.fileNum = fileNum;
+        this.loadStatistic.totalFileSizeB = fileSize;
+    }
+
+    public TUniqueId getRequestId() {
+        return requestId;
+    }
+
     /**
      * Show table names for frontend
      * If table name could not be found by id, the table id will be used instead.
@@ -255,13 +306,14 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
         }
     }
 
-    protected static void checkDataSourceInfo(Database db, List<DataDescription> dataDescriptions) throws DdlException {
+    protected static void checkDataSourceInfo(Database db, List<DataDescription> dataDescriptions,
+            EtlJobType jobType) throws DdlException {
         for (DataDescription dataDescription : dataDescriptions) {
             // loadInfo is a temporary param for the method of checkAndCreateSource.
             // <TableId,<PartitionId,<LoadInfoList>>>
             Map<Long, Map<Long, List<Source>>> loadInfo = Maps.newHashMap();
             // only support broker load now
-            Load.checkAndCreateSource(db, dataDescription, loadInfo, false);
+            Load.checkAndCreateSource(db, dataDescription, loadInfo, false, jobType);
         }
     }
 
@@ -283,17 +335,21 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
     public void execute() throws LabelAlreadyUsedException, BeginTransactionException, AnalysisException {
         writeLock();
         try {
-            // check if job state is pending
-            if (state != JobState.PENDING) {
-                return;
-            }
-            // the limit of job will be restrict when begin txn
-            beginTxn();
-            executeJob();
-            unprotectedUpdateState(JobState.LOADING);
+            unprotectedExecute();
         } finally {
             writeUnlock();
         }
+    }
+
+    public void unprotectedExecute() throws LabelAlreadyUsedException, BeginTransactionException, AnalysisException {
+        // check if job state is pending
+        if (state != JobState.PENDING) {
+            return;
+        }
+        // the limit of job will be restrict when begin txn
+        beginTxn();
+        unprotectedExecuteJob();
+        unprotectedUpdateState(JobState.LOADING);
     }
 
     public void processTimeout() {
@@ -302,14 +358,14 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
             if (isCompleted() || getDeadlineMs() >= System.currentTimeMillis() || isCommitting) {
                 return;
             }
-            executeCancel(new FailMsg(FailMsg.CancelType.TIMEOUT, "loading timeout to cancel"), true);
+            unprotectedExecuteCancel(new FailMsg(FailMsg.CancelType.TIMEOUT, "loading timeout to cancel"), true);
         } finally {
             writeUnlock();
         }
         logFinalOperation();
     }
 
-    protected void executeJob() {
+    protected void unprotectedExecuteJob() {
     }
 
     /**
@@ -348,7 +404,7 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
     public void cancelJobWithoutCheck(FailMsg failMsg, boolean abortTxn) {
         writeLock();
         try {
-            executeCancel(failMsg, abortTxn);
+            unprotectedExecuteCancel(failMsg, abortTxn);
         } finally {
             writeUnlock();
         }
@@ -377,7 +433,7 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
             }
 
             checkAuth("CANCEL LOAD");
-            executeCancel(failMsg, true);
+            unprotectedExecuteCancel(failMsg, true);
         } finally {
             writeUnlock();
         }
@@ -441,7 +497,7 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
      * @param failMsg
      * @param abortTxn true: abort txn when cancel job, false: only change the state of job and ignore abort txn
      */
-    protected void executeCancel(FailMsg failMsg, boolean abortTxn) {
+    protected void unprotectedExecuteCancel(FailMsg failMsg, boolean abortTxn) {
         LOG.warn(new LogBuilder(LogKey.LOAD_JOB, id)
                          .add("transaction_id", transactionId)
                          .add("error_msg", "Failed to execute load with error " + failMsg.getMsg())
@@ -450,9 +506,15 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
         // clean the loadingStatus
         loadingStatus.setState(TEtlState.CANCELLED);
 
-        // tasks will not be removed from task pool.
-        // it will be aborted on the stage of onTaskFinished or onTaskFailed.
+        // get load ids of all loading tasks, we will cancel their coordinator process later
+        List<TUniqueId> loadIds = Lists.newArrayList();
+        for (LoadTask loadTask : idToTasks.values()) {
+            if (loadTask instanceof LoadLoadingTask ) {
+                loadIds.add(((LoadLoadingTask)loadTask).getLoadId());
+            }
+        }
         idToTasks.clear();
+        loadStatistic.numLoadedRowsMap.clear();
 
         // set failMsg and state
         this.failMsg = failMsg;
@@ -473,6 +535,14 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
                                  .add("transaction_id", transactionId)
                                  .add("error_msg", "failed to abort txn when job is cancelled, txn will be aborted later")
                                  .build());
+            }
+        }
+        
+        // cancel all running coordinators, so that the scheduler's worker thread will be released
+        for (TUniqueId loadId : loadIds) {
+            Coordinator coordinator = QeProcessorImpl.INSTANCE.getCoordinator(loadId);
+            if (coordinator != null) {
+                coordinator.cancel();
             }
         }
 
@@ -578,6 +648,7 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
             jobInfo.add(TimeUtils.longToTimeString(finishTimestamp));
             // tracking url
             jobInfo.add(loadingStatus.getTrackingUrl());
+            jobInfo.add(loadStatistic.toJson());
             return jobInfo;
         } finally {
             readUnlock();
@@ -678,7 +749,7 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
             // record attachment in load job
             executeAfterAborted(txnState);
             // cancel load job
-            executeCancel(new FailMsg(FailMsg.CancelType.LOAD_RUN_FAIL, txnStatusChangeReason), false);
+            unprotectedExecuteCancel(new FailMsg(FailMsg.CancelType.LOAD_RUN_FAIL, txnStatusChangeReason), false);
         } finally {
             writeUnlock();
         }
@@ -749,6 +820,13 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
 
     @Override
     public void onTaskFailed(long taskId, FailMsg failMsg) {
+    }
+
+    // This analyze will be invoked after the replay is finished.
+    // The edit log of LoadJob saves the origin param which is not analyzed.
+    // So, the re-analyze must be invoked between the replay is finished and LoadJobScheduler is started.
+    // Only, the PENDING load job need to be analyzed.
+    public void analyze() {
     }
 
     @Override

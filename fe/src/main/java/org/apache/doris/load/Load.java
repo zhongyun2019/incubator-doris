@@ -17,19 +17,13 @@
 
 package org.apache.doris.load;
 
-import com.google.common.base.Joiner;
-import com.google.common.base.Preconditions;
-import com.google.common.base.Strings;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
-import com.google.gson.Gson;
-import org.apache.commons.lang.StringUtils;
 import org.apache.doris.analysis.BinaryPredicate;
 import org.apache.doris.analysis.CancelLoadStmt;
 import org.apache.doris.analysis.ColumnSeparator;
 import org.apache.doris.analysis.DataDescription;
 import org.apache.doris.analysis.DeleteStmt;
+import org.apache.doris.analysis.Expr;
+import org.apache.doris.analysis.ImportColumnDesc;
 import org.apache.doris.analysis.IsNullPredicate;
 import org.apache.doris.analysis.LabelName;
 import org.apache.doris.analysis.LiteralExpr;
@@ -87,7 +81,6 @@ import org.apache.doris.task.AgentClient;
 import org.apache.doris.task.AgentTask;
 import org.apache.doris.task.AgentTaskExecutor;
 import org.apache.doris.task.AgentTaskQueue;
-import org.apache.doris.task.CancelDeleteTask;
 import org.apache.doris.task.PushTask;
 import org.apache.doris.thrift.TEtlState;
 import org.apache.doris.thrift.TMiniLoadRequest;
@@ -99,6 +92,16 @@ import org.apache.doris.transaction.TableCommitInfo;
 import org.apache.doris.transaction.TransactionState;
 import org.apache.doris.transaction.TransactionState.LoadJobSourceType;
 import org.apache.doris.transaction.TransactionStatus;
+
+import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import com.google.gson.Gson;
+
+import org.apache.commons.lang.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -298,8 +301,9 @@ public class Load {
             formatType = params.get(LoadStmt.KEY_IN_PARAM_FORMAT_TYPE);
         }
 
-        DataDescription dataDescription = new DataDescription(tableName, partitionNames, filePaths, columnNames,
-                                                    columnSeparator, formatType, false, null);
+        DataDescription dataDescription = new DataDescription(tableName, partitionNames, filePaths,
+                                                                             columnNames,
+                                                                             columnSeparator, formatType, false, null);
         dataDescription.setLineDelimiter(lineDelimiter);
         dataDescription.setBeAddr(beAddr);
         // parse hll param pair
@@ -359,56 +363,6 @@ public class Load {
 
         // create job
         LoadJob job = createLoadJob(stmt, etlJobType, db, timestamp);
-        addLoadJob(job, db);
-    }
-
-    // for insert select from or create as stmt
-    public void addLoadJob(String label, String dbName,
-                           long tableId, Map<Long, Integer> indexIdToSchemaHash,
-                           long transactionId,
-                           List<String> fileList, long timestamp) throws DdlException {
-        // get db and table
-        Database db = Catalog.getInstance().getDb(dbName);
-        if (db == null) {
-            throw new DdlException("Database[" + dbName + "] does not exist");
-        }
-
-        OlapTable table = null;
-        db.readLock();
-        try {
-            table = (OlapTable) db.getTable(tableId);
-        } finally {
-            db.readUnlock();
-        }
-        if (table == null) {
-            throw new DdlException("Table[" + tableId + "] does not exist");
-        }
-
-        // create job
-        DataDescription desc = new DataDescription(table.getName(), null, Lists.newArrayList(""),
-                                                   null, null, false, null);
-        LoadStmt stmt = new LoadStmt(new LabelName(dbName, label), Lists.newArrayList(desc), null, null, null);
-        LoadJob job = createLoadJob(stmt, EtlJobType.INSERT, db, timestamp);
-
-        // add schema hash
-        for (Map.Entry<Long, Integer> entry : indexIdToSchemaHash.entrySet()) {
-            job.getTableLoadInfo(tableId).addIndexSchemaHash(entry.getKey(), entry.getValue());
-        }
-
-        // file size use -1 temporarily
-        Map<String, Long> fileMap = Maps.newHashMap();
-        for (String filePath : fileList) {
-            fileMap.put(filePath, -1L);
-        }
-
-        // update job info to etl finish
-        EtlStatus status = job.getEtlJobStatus();
-        status.setState(TEtlState.FINISHED);
-        status.setFileMap(fileMap);
-        job.setState(JobState.ETL);
-        job.setTransactionId(transactionId);
-
-        // add load job
         addLoadJob(job, db);
     }
 
@@ -520,7 +474,7 @@ public class Load {
         Map<Long, Map<Long, List<Source>>> tableToPartitionSources = Maps.newHashMap();
         for (DataDescription dataDescription : dataDescriptions) {
             // create source
-            checkAndCreateSource(db, dataDescription, tableToPartitionSources, job.getDeleteFlag());
+            checkAndCreateSource(db, dataDescription, tableToPartitionSources, job.getDeleteFlag(), etlJobType);
             job.addTableName(dataDescription.getTableName());
         }
         for (Entry<Long, Map<Long, List<Source>>> tableEntry : tableToPartitionSources.entrySet()) {
@@ -631,7 +585,7 @@ public class Load {
         } else if (etlJobType == EtlJobType.BROKER) {
             if (job.getTimeoutSecond() == 0) {
                 // set default timeout
-                job.setTimeoutSecond(Config.pull_load_task_default_timeout_second);
+                job.setTimeoutSecond(Config.broker_load_default_timeout_second);
             }
         } else if (etlJobType == EtlJobType.INSERT) {
             job.setPrority(TPriority.HIGH);
@@ -649,7 +603,7 @@ public class Load {
 
     public static void checkAndCreateSource(Database db, DataDescription dataDescription,
                                             Map<Long, Map<Long, List<Source>>> tableToPartitionSources,
-                                            boolean deleteFlag)
+                                            boolean deleteFlag, EtlJobType jobType)
             throws DdlException {
         Source source = new Source(dataDescription.getFilePaths());
         long tableId = -1;
@@ -667,6 +621,11 @@ public class Load {
             tableId = table.getId();
             if (table.getType() != TableType.OLAP) {
                 throw new DdlException("Table [" + tableName + "] is not olap table");
+            }
+
+            if (((OlapTable) table).getPartitionInfo().isMultiColumnPartition() && jobType == EtlJobType.HADOOP) {
+                throw new DdlException("Load by hadoop cluster does not support table with multi partition columns."
+                        + " Table: " + table.getName() + ". Try using broker load. See 'help broker load;'");
             }
 
             // check partition
@@ -694,11 +653,15 @@ public class Load {
             for (Column column : tableSchema) {
                 nameToTableColumn.put(column.getName(), column);
             }
-
-            // source columns
             List<String> columnNames = Lists.newArrayList();
-            List<String> assignColumnNames = dataDescription.getColumnNames();
-            if (assignColumnNames == null) {
+            List<String> assignColumnNames = Lists.newArrayList();
+            if (dataDescription.getColumnNames() != null) {
+                assignColumnNames.addAll(dataDescription.getColumnNames());
+                if (dataDescription.getColumnsFromPath() != null) {
+                    assignColumnNames.addAll(dataDescription.getColumnsFromPath());
+                }
+            }
+            if (assignColumnNames.isEmpty()) {
                 // use table columns
                 for (Column column : tableSchema) {
                     columnNames.add(column.getName());
@@ -716,14 +679,19 @@ public class Load {
             source.setColumnNames(columnNames);
 
             // check default value
-            Map<String, Pair<String, List<String>>> assignColumnToFunction = dataDescription.getColumnMapping();
+            Map<String, Pair<String, List<String>>> columnToHadoopFunction = dataDescription.getColumnToHadoopFunction();
+            List<ImportColumnDesc> parsedColumnExprList = dataDescription.getParsedColumnExprList();
+            Map<String, Expr> parsedColumnExprMap = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
+            for (ImportColumnDesc importColumnDesc : parsedColumnExprList) {
+                parsedColumnExprMap.put(importColumnDesc.getColumnName(), importColumnDesc.getExpr());
+            }
             for (Column column : tableSchema) {
                 String columnName = column.getName();
                 if (columnNames.contains(columnName)) {
                     continue;
                 }
 
-                if (assignColumnToFunction != null && assignColumnToFunction.containsKey(columnName)) {
+                if (parsedColumnExprMap.containsKey(columnName)) {
                     continue;
                 }
 
@@ -731,18 +699,10 @@ public class Load {
                     continue;
                 }
 
-                if (deleteFlag && !column.isKey()) {
-                    List<String> args = Lists.newArrayList();
-                    args.add("0");
-                    Pair<String, List<String>> functionPair = new Pair<String, List<String>>("default_value", args);
-                    assignColumnToFunction.put(columnName, functionPair);
-                    continue;
-                }
-
                 throw new DdlException("Column has no default value. column: " + columnName);
             }
 
-            // check negative for sum aggreate type
+            // check negative for sum aggregate type
             if (dataDescription.isNegative()) {
                 for (Column column : tableSchema) {
                     if (!column.isKey() && column.getAggregationType() != AggregateType.SUM) {
@@ -754,7 +714,7 @@ public class Load {
             // check hll
             for (Column column : tableSchema) {
                 if (column.getDataType() == PrimitiveType.HLL) {
-                    if (assignColumnToFunction != null && !assignColumnToFunction.containsKey(column.getName())) {
+                    if (columnToHadoopFunction != null && !columnToHadoopFunction.containsKey(column.getName())) {
                         throw new DdlException("Hll column is not assigned. column:" + column.getName());
                     }
                 }
@@ -766,9 +726,9 @@ public class Load {
             for (String columnName : columnNames) {
                 columnNameMap.put(columnName, columnName);
             }
-            if (assignColumnToFunction != null) {
+            if (columnToHadoopFunction != null) {
                 columnToFunction = Maps.newHashMap();
-                for (Entry<String, Pair<String, List<String>>> entry : assignColumnToFunction.entrySet()) {
+                for (Entry<String, Pair<String, List<String>>> entry : columnToHadoopFunction.entrySet()) {
                     String mappingColumnName = entry.getKey();
                     if (!nameToTableColumn.containsKey(mappingColumnName)) {
                         throw new DdlException("Mapping column is not in table. column: " + mappingColumnName);
@@ -778,7 +738,7 @@ public class Load {
                     Pair<String, List<String>> function = entry.getValue();
                     try {
                         DataDescription.validateMappingFunction(function.first, function.second, columnNameMap,
-                                                                mappingColumn, dataDescription.isPullLoad());
+                                                                mappingColumn, dataDescription.isHadoopLoad());
                     } catch (AnalysisException e) {
                         throw new DdlException(e.getMessage());
                     }
@@ -1476,14 +1436,14 @@ public class Load {
                 if (tableNames.isEmpty()) {
                     // forward compatibility
                     if (!Catalog.getCurrentCatalog().getAuth().checkDbPriv(ConnectContext.get(), dbName,
-                                                                           PrivPredicate.SHOW)) {
+                                                                           PrivPredicate.LOAD)) {
                         continue;
                     }
                 } else {
                     boolean auth = true;
                     for (String tblName : tableNames) {
                         if (!Catalog.getCurrentCatalog().getAuth().checkTblPriv(ConnectContext.get(), dbName,
-                                                                                tblName, PrivPredicate.SHOW)) {
+                                                                                tblName, PrivPredicate.LOAD)) {
                             auth = false;
                             break;
                         }
@@ -3452,26 +3412,6 @@ public class Load {
             } finally {
                 db.writeUnlock();
             }
-        } catch (Exception e) {
-            // cancel delete
-            // need not save cancel delete task in AgentTaskQueue
-            AgentBatchTask cancelDeleteBatchTask = new AgentBatchTask();
-            for (AgentTask task : deleteBatchTask.getAllTasks()) {
-                PushTask pushTask = (PushTask) task;
-                CancelDeleteTask cancelDeleteTask =
-                        new CancelDeleteTask(task.getBackendId(), task.getDbId(), task.getTableId(),
-                                             task.getPartitionId(), task.getIndexId(), task.getTabletId(),
-                                             pushTask.getSchemaHash(), pushTask.getVersion(),
-                                             pushTask.getVersionHash());
-                cancelDeleteBatchTask.addTask(cancelDeleteTask);
-            }
-            if (cancelDeleteBatchTask.getTaskNum() > 0) {
-                AgentTaskExecutor.submit(cancelDeleteBatchTask);
-            }
-
-            String failMsg = "delete fail, " + e.getMessage();
-            LOG.warn(failMsg);
-            throw new DdlException(failMsg);
         } finally {
             // clear tasks
             List<AgentTask> tasks = deleteBatchTask.getAllTasks();

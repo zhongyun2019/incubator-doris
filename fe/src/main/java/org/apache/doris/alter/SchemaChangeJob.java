@@ -514,7 +514,9 @@ public class SchemaChangeJob extends AlterJob {
                     for (Tablet tablet : index.getTablets()) {
                         long tabletId = tablet.getId();
                         for (Replica replica : tablet.getReplicas()) {
-                            if (replica.getState() == ReplicaState.CLONE || replica.getState() == ReplicaState.NORMAL) {
+                            if (replica.getState() == ReplicaState.CLONE
+                                    || replica.getState() == ReplicaState.DECOMMISSION
+                                    || replica.getState() == ReplicaState.NORMAL) {
                                 continue;
                             }
                             Preconditions.checkState(replica.getState() == ReplicaState.SCHEMA_CHANGE);
@@ -619,6 +621,9 @@ public class SchemaChangeJob extends AlterJob {
             long rowCount = finishTabletInfo.getRow_count();
             // do not need check version > replica.getVersion, because the new replica's version is first set by sc
             replica.updateVersionInfo(version, versionHash, dataSize, rowCount);
+            if (finishTabletInfo.isSetPath_hash()) {
+                replica.setPathHash(finishTabletInfo.getPath_hash());
+            }
         } finally {
             db.writeUnlock();
         }
@@ -847,8 +852,8 @@ public class SchemaChangeJob extends AlterJob {
                 }
 
                 // 3. update base schema if changed
-                if (this.changedIndexIdToSchema.containsKey(tableId)) {
-                    table.setNewBaseSchema(this.changedIndexIdToSchema.get(tableId));
+                if (this.changedIndexIdToSchema.containsKey(olapTable.getBaseIndexId())) {
+                    table.setNewBaseSchema(this.changedIndexIdToSchema.get(olapTable.getBaseIndexId()));
                 }
 
                 // 4. update table bloom filter columns
@@ -918,7 +923,8 @@ public class SchemaChangeJob extends AlterJob {
                     // set state to SCHEMA_CHANGE
                     for (Tablet tablet : index.getTablets()) {
                         for (Replica replica : tablet.getReplicas()) {
-                            if (replica.getState() == ReplicaState.CLONE) {
+                            if (replica.getState() == ReplicaState.CLONE
+                                    || replica.getState() == ReplicaState.DECOMMISSION) {
                                 // add log here, because there should no more CLONE replica when processing alter jobs.
                                 LOG.warn(String.format(
                                         "replica %d of tablet %d in backend %d state is invalid: %s",
@@ -1011,7 +1017,7 @@ public class SchemaChangeJob extends AlterJob {
                 if (newStorageType != null) {
                     olapTable.setIndexStorageType(indexId, newStorageType);
                 }
-                if (indexId == olapTable.getId()) {
+                if (indexId == olapTable.getBaseIndexId()) {
                     olapTable.setNewBaseSchema(entry.getValue());
                 }
             }
@@ -1063,7 +1069,9 @@ public class SchemaChangeJob extends AlterJob {
                     }
                     for (Tablet tablet : index.getTablets()) {
                         for (Replica replica : tablet.getReplicas()) {
-                            if (replica.getState() == ReplicaState.CLONE || replica.getState() == ReplicaState.NORMAL) {
+                            if (replica.getState() == ReplicaState.CLONE
+                                    || replica.getState() == ReplicaState.DECOMMISSION
+                                    || replica.getState() == ReplicaState.NORMAL) {
                                 continue;
                             }
                             replica.setState(ReplicaState.NORMAL);

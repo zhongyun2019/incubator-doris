@@ -17,7 +17,6 @@
 
 package org.apache.doris.planner;
 
-import org.apache.doris.catalog.AggregateType;
 import org.apache.doris.analysis.Analyzer;
 import org.apache.doris.analysis.ArithmeticExpr;
 import org.apache.doris.analysis.Expr;
@@ -30,6 +29,7 @@ import org.apache.doris.analysis.SlotDescriptor;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.StringLiteral;
 import org.apache.doris.analysis.TupleDescriptor;
+import org.apache.doris.catalog.AggregateType;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.ScalarType;
@@ -47,6 +47,7 @@ import org.apache.doris.thrift.TPlanNode;
 import org.apache.doris.thrift.TPlanNodeType;
 import org.apache.doris.thrift.TScanRange;
 import org.apache.doris.thrift.TScanRangeLocations;
+import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -64,6 +65,7 @@ import java.util.Map;
 public class StreamLoadScanNode extends ScanNode {
     private static final Logger LOG = LogManager.getLogger(StreamLoadScanNode.class);
 
+    private TUniqueId loadId;
     // TODO(zc): now we use scanRange
     // input parameter
     private Table dstTable;
@@ -79,8 +81,9 @@ public class StreamLoadScanNode extends ScanNode {
 
     // used to construct for streaming loading
     public StreamLoadScanNode(
-            PlanNodeId id, TupleDescriptor tupleDesc, Table dstTable, StreamLoadTask streamLoadTask) {
+            TUniqueId loadId, PlanNodeId id, TupleDescriptor tupleDesc, Table dstTable, StreamLoadTask streamLoadTask) {
         super(id, tupleDesc, "StreamLoadScanNode");
+        this.loadId = loadId;
         this.dstTable = dstTable;
         this.streamLoadTask = streamLoadTask;
     }
@@ -103,7 +106,7 @@ public class StreamLoadScanNode extends ScanNode {
                 break;
             case FILE_STREAM:
                 rangeDesc.path = "Invalid Path";
-                rangeDesc.load_id = streamLoadTask.getId();
+                rangeDesc.load_id = loadId;
                 break;
             default:
                 throw new UserException("unsupported file type, type=" + streamLoadTask.getFileType());
@@ -115,6 +118,7 @@ public class StreamLoadScanNode extends ScanNode {
         srcTupleDesc = analyzer.getDescTbl().createTupleDescriptor("StreamLoadScanNode");
 
         TBrokerScanRangeParams params = new TBrokerScanRangeParams();
+        params.setStrict_mode(streamLoadTask.isStrictMode());
 
         // parse columns header. this contain map from input column to column of destination table
         // columns: k1, k2, v1, v2=k1 + k2
@@ -252,7 +256,7 @@ public class StreamLoadScanNode extends ScanNode {
             if (expr == null) {
                 SlotDescriptor srcSlotDesc = slotDescByName.get(dstSlotDesc.getColumn().getName());
                 if (srcSlotDesc != null) {
-                    destSidToSrcSidWithoutTrans.put(srcSlotDesc.getId().asInt(), dstSlotDesc.getId().asInt());
+                    destSidToSrcSidWithoutTrans.put(dstSlotDesc.getId().asInt(), srcSlotDesc.getId().asInt());
                     // If dest is allow null, we set source to nullable
                     if (dstSlotDesc.getColumn().isAllowNull()) {
                         srcSlotDesc.setIsNullable(true);
@@ -284,6 +288,9 @@ public class StreamLoadScanNode extends ScanNode {
                 }
                 expr.setType(Type.HLL);
             }
+
+            checkBitmapCompatibility(dstSlotDesc, expr);
+
             if (negative && dstSlotDesc.getColumn().getAggregationType() == AggregateType.SUM) {
                 expr = new ArithmeticExpr(ArithmeticExpr.Operator.MULTIPLY, expr, new IntLiteral(-1));
                 expr.analyze(analyzer);

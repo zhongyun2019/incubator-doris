@@ -25,6 +25,7 @@ import org.apache.doris.analysis.ImportWhereStmt;
 import org.apache.doris.analysis.SqlParser;
 import org.apache.doris.analysis.SqlScanner;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.UserException;
 import org.apache.doris.load.routineload.RoutineLoadJob;
 import org.apache.doris.thrift.TFileFormatType;
@@ -56,6 +57,8 @@ public class StreamLoadTask {
     private String partitions;
     private String path;
     private boolean negative;
+    private boolean strictMode = true;
+    private int timeout = Config.stream_load_default_timeout_second;
 
     public StreamLoadTask(TUniqueId id, long txnId, TFileType fileType, TFileFormatType formatType) {
         this.id = id;
@@ -104,6 +107,14 @@ public class StreamLoadTask {
         return negative;
     }
 
+    public boolean isStrictMode() {
+        return strictMode;
+    }
+
+    public int getTimeout() {
+        return timeout;
+    }
+
     public static StreamLoadTask fromTStreamLoadPutRequest(TStreamLoadPutRequest request) throws UserException {
         StreamLoadTask streamLoadTask = new StreamLoadTask(request.getLoadId(), request.getTxnId(),
                                                            request.getFileType(), request.getFormatType());
@@ -134,6 +145,12 @@ public class StreamLoadTask {
         if (request.isSetNegative()) {
             negative = request.isNegative();
         }
+        if (request.isSetTimeout()) {
+            timeout = request.getTimeout();
+        }
+        if (request.isSetStrictMode()) {
+            strictMode = request.isStrictMode();
+        }
     }
 
     public static StreamLoadTask fromRoutineLoadJob(RoutineLoadJob routineLoadJob) {
@@ -149,6 +166,7 @@ public class StreamLoadTask {
         whereExpr = routineLoadJob.getWhereExpr();
         columnSeparator = routineLoadJob.getColumnSeparator();
         partitions = routineLoadJob.getPartitions() == null ? null : Joiner.on(",").join(routineLoadJob.getPartitions());
+        strictMode = routineLoadJob.isStrictMode();
     }
 
     private void setColumnToColumnExpr(String columns) throws UserException {

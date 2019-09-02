@@ -39,7 +39,6 @@ struct RowBlockInfo {
 
     uint32_t checksum;
     uint32_t row_num;       // block最大数据行数
-    DataFileType data_file_type;
     bool null_supported;
     std::vector<uint32_t> column_ids;
 };
@@ -57,7 +56,7 @@ class RowBlock {
     friend class RowBlockChanger;
     friend class VectorizedRowBatch;
 public:
-    RowBlock(const std::vector<FieldInfo>& tablet_schema);
+    RowBlock(const TabletSchema* schema);
 
     // 注意回收内部buffer
     ~RowBlock();
@@ -71,12 +70,9 @@ public:
         cursor->attach(_mem_buf + row_index * _mem_row_bytes);
     }
 
-    inline void set_row(uint32_t row_index, const RowCursor& cursor) const {
-        memcpy(_mem_buf + row_index * _mem_row_bytes, cursor.get_buf(), _mem_row_bytes);
-    }
-
-    inline void set_row(uint32_t row_index, const char* row) const {
-        memcpy(_mem_buf + row_index * _mem_row_bytes, row, _mem_row_bytes);
+    template<typename RowType>
+    inline void set_row(uint32_t row_index, const RowType& row) const {
+        memcpy(_mem_buf + row_index * _mem_row_bytes, row.row_ptr(), _mem_row_bytes);
     }
 
     // called when finished fill this row_block
@@ -91,8 +87,7 @@ public:
 
     const uint32_t row_num() const { return _info.row_num; }
     const RowBlockInfo& row_block_info() const { return _info; }
-    const std::vector<FieldInfo>& tablet_schema() const { return _tablet_schema; }
-
+    const TabletSchema& tablet_schema() const { return *_schema; }
     size_t capacity() const { return _capacity; }
 
     // Return field pointer, this pointer point to the nullbyte before the field
@@ -155,7 +150,7 @@ private:
     };
 
     bool has_nullbyte() {
-        return _data_file_type == COLUMN_ORIENTED_FILE || _null_supported;
+        return _null_supported;
     }
 
     // Compute layout for storage buffer and  memory buffer
@@ -163,13 +158,9 @@ private:
 
     uint32_t _capacity;
     RowBlockInfo _info;
-    const std::vector<FieldInfo>& _tablet_schema;     // 内部保存的schema句柄
-
+    const TabletSchema* _schema;     // 内部保存的schema句柄
+    
     bool _null_supported;
-    DataFileType _data_file_type;
-
-    size_t _field_count = 0;
-    bool _need_checksum = true;
 
     // Data in memory is construct from row cursors, these row cursors's size is equal
     char* _mem_buf = nullptr;

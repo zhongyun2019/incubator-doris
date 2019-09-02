@@ -62,7 +62,8 @@ public class BrokerLoadJobTest {
                                  @Injectable DataDescription dataDescription,
                                  @Mocked Catalog catalog,
                                  @Injectable Database database,
-                                 @Injectable BrokerDesc brokerDesc) {
+                                 @Injectable BrokerDesc brokerDesc,
+                                 @Injectable String originStmt) {
         List<DataDescription> dataDescriptionList = Lists.newArrayList();
         dataDescriptionList.add(dataDescription);
 
@@ -88,7 +89,7 @@ public class BrokerLoadJobTest {
         };
 
         try {
-            BrokerLoadJob brokerLoadJob = BrokerLoadJob.fromLoadStmt(loadStmt);
+            BrokerLoadJob brokerLoadJob = BrokerLoadJob.fromLoadStmt(loadStmt, originStmt);
             Assert.fail();
         } catch (DdlException e) {
             System.out.println("could not find table named " + tableName);
@@ -102,7 +103,8 @@ public class BrokerLoadJobTest {
                                  @Injectable LabelName labelName,
                                  @Injectable Database database,
                                  @Injectable OlapTable olapTable,
-                                 @Mocked Catalog catalog) {
+                                 @Mocked Catalog catalog,
+                                 @Injectable String originStmt) {
 
         String label = "label";
         long dbId = 1;
@@ -110,7 +112,6 @@ public class BrokerLoadJobTest {
         String databaseName = "database";
         List<DataDescription> dataDescriptionList = Lists.newArrayList();
         dataDescriptionList.add(dataDescription);
-
 
         new Expectations() {
             {
@@ -130,8 +131,6 @@ public class BrokerLoadJobTest {
                 result = olapTable;
                 dataDescription.getPartitionNames();
                 result = null;
-                dataDescription.getColumnNames();
-                result = null;
                 database.getId();
                 result = dbId;
             }
@@ -141,12 +140,12 @@ public class BrokerLoadJobTest {
             @Mock
             public void checkAndCreateSource(Database db, DataDescription dataDescription,
                                              Map<Long, Map<Long, List<Source>>> tableToPartitionSources,
-                                             boolean deleteFlag) {
+                                             boolean deleteFlag, EtlJobType jobType) {
             }
         };
 
         try {
-            BrokerLoadJob brokerLoadJob = BrokerLoadJob.fromLoadStmt(loadStmt);
+            BrokerLoadJob brokerLoadJob = BrokerLoadJob.fromLoadStmt(loadStmt, originStmt);
             Assert.assertEquals(Long.valueOf(dbId), Deencapsulation.getField(brokerLoadJob, "dbId"));
             Assert.assertEquals(label, Deencapsulation.getField(brokerLoadJob, "label"));
             Assert.assertEquals(JobState.PENDING, Deencapsulation.getField(brokerLoadJob, "state"));
@@ -191,7 +190,7 @@ public class BrokerLoadJobTest {
     @Test
     public void testExecuteJob(@Mocked MasterTaskExecutor masterTaskExecutor) {
         BrokerLoadJob brokerLoadJob = new BrokerLoadJob();
-        brokerLoadJob.executeJob();
+        brokerLoadJob.unprotectedExecuteJob();
 
         Map<Long, LoadTask> idToTasks = Deencapsulation.getField(brokerLoadJob, "idToTasks");
         Assert.assertEquals(1, idToTasks.size());

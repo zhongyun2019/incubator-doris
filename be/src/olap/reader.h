@@ -36,10 +36,12 @@
 #include "util/runtime_profile.h"
 
 #include "olap/column_predicate.h"
+#include "olap/tablet.h"
+#include "olap/rowset/rowset_reader.h"
 
 namespace doris {
 
-class OLAPTable;
+class Tablet;
 class RowCursor;
 class RowBlock;
 class CollectIterator;
@@ -48,36 +50,45 @@ class RuntimeState;
 // Params for Reader,
 // mainly include tablet, data version and fetch range.
 struct ReaderParams {
-    OLAPTablePtr olap_table;
+    TabletSharedPtr tablet;
     ReaderType reader_type;
     bool aggregation;
     Version version;
+    // possible values are "gt", "ge", "eq"
     std::string range;
+    // possible values are "lt", "le"
     std::string end_range;
     std::vector<OlapTuple> start_key;
     std::vector<OlapTuple> end_key;
     std::vector<TCondition> conditions;
     // The ColumnData will be set when using Merger, eg Cumulative, BE.
-    std::vector<ColumnData*> olap_data_arr;
+    std::vector<RowsetReaderSharedPtr> rs_readers;
     std::vector<uint32_t> return_columns;
     RuntimeProfile* profile;
     RuntimeState* runtime_state;
 
     ReaderParams() :
             reader_type(READER_QUERY),
-            aggregation(true),
+            aggregation(false),
+            version(-1, 0),
             profile(NULL),
             runtime_state(NULL) {
         start_key.clear();
         end_key.clear();
         conditions.clear();
-        olap_data_arr.clear();
+        rs_readers.clear();
+    }
+
+    void check_validation() const {
+        if (version.first == -1) {
+            LOG(FATAL) << "verison is not set. tablet=" << tablet->full_name();
+        }
     }
 
     std::string to_string() {
         std::stringstream ss;
 
-        ss << "table=" << olap_table->full_name()
+        ss << "tablet=" << tablet->full_name()
            << " reader_type=" << reader_type
            << " aggregation=" << aggregation
            << " version=" << version.first << "-" << version.second
@@ -111,15 +122,15 @@ public:
     void close();
 
     // Reader next row with aggregation.
-    OLAPStatus next_row_with_aggregation(RowCursor *row_cursor, bool *eof) {
-        return (this->*_next_row_func)(row_cursor, eof);
+    OLAPStatus next_row_with_aggregation(RowCursor *row_cursor, Arena* arena, bool *eof) {
+        return (this->*_next_row_func)(row_cursor, arena, eof);
     }
 
     uint64_t merged_rows() const {
         return _merged_rows;
     }
 
-    uint64_t filted_rows() const {
+    uint64_t filtered_rows() const {
         return _stats.rows_del_filtered;
     }
 
@@ -164,18 +175,18 @@ private:
 
     OLAPStatus _init_params(const ReaderParams& read_params);
 
-    OLAPStatus _acquire_data_sources(const ReaderParams& read_params);
+    OLAPStatus _capture_rs_readers(const ReaderParams& read_params);
 
     OLAPStatus _init_keys_param(const ReaderParams& read_params);
 
     OLAPStatus _init_conditions_param(const ReaderParams& read_params);
 
-    ColumnPredicate* _new_eq_pred(FieldInfo& type, int index, const std::string& cond);
-    ColumnPredicate* _new_ne_pred(FieldInfo& type, int index, const std::string& cond);
-    ColumnPredicate* _new_lt_pred(FieldInfo& type, int index, const std::string& cond);
-    ColumnPredicate* _new_le_pred(FieldInfo& type, int index, const std::string& cond);
-    ColumnPredicate* _new_gt_pred(FieldInfo& type, int index, const std::string& cond);
-    ColumnPredicate* _new_ge_pred(FieldInfo& type, int index, const std::string& cond);
+    ColumnPredicate* _new_eq_pred(const TabletColumn& column, int index, const std::string& cond);
+    ColumnPredicate* _new_ne_pred(const TabletColumn& column, int index, const std::string& cond);
+    ColumnPredicate* _new_lt_pred(const TabletColumn& column, int index, const std::string& cond);
+    ColumnPredicate* _new_le_pred(const TabletColumn& column, int index, const std::string& cond);
+    ColumnPredicate* _new_gt_pred(const TabletColumn& column, int index, const std::string& cond);
+    ColumnPredicate* _new_ge_pred(const TabletColumn& column, int index, const std::string& cond);
 
     ColumnPredicate* _parse_to_predicate(const TCondition& condition);
 
@@ -186,11 +197,11 @@ private:
 
     OLAPStatus _init_load_bf_columns(const ReaderParams& read_params);
 
-    OLAPStatus _attach_data_to_merge_set(bool first, bool *eof);
-    
-    OLAPStatus _dup_key_next_row(RowCursor* row_cursor, bool* eof);
-    OLAPStatus _agg_key_next_row(RowCursor* row_cursor, bool* eof);
-    OLAPStatus _unique_key_next_row(RowCursor* row_cursor, bool* eof);
+    OLAPStatus _dup_key_next_row(RowCursor* row_cursor, Arena* arena, bool* eof);
+    OLAPStatus _agg_key_next_row(RowCursor* row_cursor, Arena* arena, bool* eof);
+    OLAPStatus _unique_key_next_row(RowCursor* row_cursor, Arena* arena, bool* eof);
+
+    TabletSharedPtr tablet() { return _tablet; }
 
 private:
     std::unique_ptr<MemTracker> _tracker;
@@ -201,14 +212,17 @@ private:
 
     Version _version;
 
-    OLAPTablePtr _olap_table;
+    TabletSharedPtr _tablet;
 
-    // _own_data_sources is data source that reader aquire from olap_table, so we need to
+    // _own_rs_readers is data source that reader aquire from tablet, so we need to
     // release these when reader closing
-    std::vector<ColumnData*> _own_data_sources;
-    std::vector<ColumnData*> _data_sources;
+    std::vector<RowsetReaderSharedPtr> _own_rs_readers;
+    std::vector<RowsetReaderSharedPtr> _rs_readers;
+    RowsetReaderContext _reader_context;
 
     KeysParam _keys_param;
+    std::vector<bool> _is_lower_keys_included;
+    std::vector<bool> _is_upper_keys_included;
     int32_t _next_key_index;
 
     Conditions _conditions;
@@ -216,7 +230,7 @@ private:
 
     DeleteHandler _delete_handler;
 
-    OLAPStatus (Reader::*_next_row_func)(RowCursor* row_cursor, bool* eof) = nullptr;
+    OLAPStatus (Reader::*_next_row_func)(RowCursor* row_cursor, Arena* arena, bool* eof) = nullptr;
 
     bool _aggregation;
     bool _version_locked;

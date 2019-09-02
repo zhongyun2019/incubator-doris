@@ -47,6 +47,9 @@ Status StreamLoadExecutor::execute_plan_fragment(StreamLoadContext* ctx) {
     // submit this params
 #ifndef BE_TEST
     ctx->ref();
+    LOG(INFO) << "begin to execute job:" << ctx->label 
+              << " with txn id:" << ctx->txn_id
+              << " with query id:" << print_id(ctx->put_result.params.params.query_id);
     auto st = _exec_env->fragment_mgr()->exec_plan_fragment(
         ctx->put_result.params,
         [ctx] (PlanFragmentExecutor* executor) {
@@ -125,6 +128,7 @@ Status StreamLoadExecutor::begin_txn(StreamLoadContext* ctx) {
     if (ctx->timeout_second != -1) {
         request.__set_timeout(ctx->timeout_second);
     }
+    request.__set_request_id(ctx->id.to_thrift());
 
     TLoadTxnBeginResult result;
 #ifndef BE_TEST

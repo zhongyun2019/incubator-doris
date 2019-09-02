@@ -21,6 +21,8 @@ package org.apache.doris.load.loadv2;
 import org.apache.doris.analysis.BrokerDesc;
 import org.apache.doris.analysis.DataDescription;
 import org.apache.doris.analysis.LoadStmt;
+import org.apache.doris.analysis.SqlParser;
+import org.apache.doris.analysis.SqlScanner;
 import org.apache.doris.catalog.AuthorizationInfo;
 import org.apache.doris.catalog.Catalog;
 import org.apache.doris.catalog.Database;
@@ -29,9 +31,11 @@ import org.apache.doris.catalog.Table;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.LabelAlreadyUsedException;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.io.Text;
 import org.apache.doris.common.util.LogBuilder;
 import org.apache.doris.common.util.LogKey;
 import org.apache.doris.load.BrokerFileGroup;
@@ -39,6 +43,7 @@ import org.apache.doris.load.EtlJobType;
 import org.apache.doris.load.FailMsg;
 import org.apache.doris.load.PullLoadSourceInfo;
 import org.apache.doris.service.FrontendOptions;
+import org.apache.doris.thrift.TUniqueId;
 import org.apache.doris.transaction.BeginTransactionException;
 import org.apache.doris.transaction.TabletCommitInfo;
 import org.apache.doris.transaction.TransactionState;
@@ -53,13 +58,16 @@ import org.apache.logging.log4j.Logger;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.io.StringReader;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * There are 3 steps in BrokerLoadJob: BrokerPendingTask, LoadLoadingTask, CommitAndPublishTxn.
- * Step1: BrokerPendingTask will be created on method of executeJob.
+ * Step1: BrokerPendingTask will be created on method of unprotectedExecuteJob.
  * Step2: LoadLoadingTasks will be created by the method of onTaskFinished when BrokerPendingTask is finished.
  * Step3: CommitAndPublicTxn will be called by the method of onTaskFinished when all of LoadLoadingTasks are finished.
  */
@@ -70,6 +78,10 @@ public class BrokerLoadJob extends LoadJob {
     // input params
     private List<DataDescription> dataDescriptions = Lists.newArrayList();
     private BrokerDesc brokerDesc;
+    // this param is used to persist the expr of columns
+    // the origin stmt is persisted instead of columns expr
+    // the expr of columns will be reanalyze when the log is replayed
+    private String originStmt;
 
     // include broker desc and data desc
     private PullLoadSourceInfo dataSourceInfo = new PullLoadSourceInfo();
@@ -81,17 +93,19 @@ public class BrokerLoadJob extends LoadJob {
         this.jobType = EtlJobType.BROKER;
     }
 
-    public BrokerLoadJob(long dbId, String label, BrokerDesc brokerDesc, List<DataDescription> dataDescriptions)
+    public BrokerLoadJob(long dbId, String label, BrokerDesc brokerDesc, List<DataDescription> dataDescriptions,
+                         String originStmt)
             throws MetaNotFoundException {
         super(dbId, label);
-        this.timeoutSecond = Config.pull_load_task_default_timeout_second;
+        this.timeoutSecond = Config.broker_load_default_timeout_second;
         this.dataDescriptions = dataDescriptions;
         this.brokerDesc = brokerDesc;
+        this.originStmt = originStmt;
         this.jobType = EtlJobType.BROKER;
         this.authorizationInfo = gatherAuthInfo();
     }
 
-    public static BrokerLoadJob fromLoadStmt(LoadStmt stmt) throws DdlException {
+    public static BrokerLoadJob fromLoadStmt(LoadStmt stmt, String originStmt) throws DdlException {
         // get db id
         String dbName = stmt.getLabel().getDbName();
         Database db = Catalog.getCurrentCatalog().getDb(stmt.getLabel().getDbName());
@@ -99,12 +113,13 @@ public class BrokerLoadJob extends LoadJob {
             throw new DdlException("Database[" + dbName + "] does not exist");
         }
         // check data source info
-        LoadJob.checkDataSourceInfo(db, stmt.getDataDescriptions());
+        LoadJob.checkDataSourceInfo(db, stmt.getDataDescriptions(), EtlJobType.BROKER);
 
         // create job
         try {
             BrokerLoadJob brokerLoadJob = new BrokerLoadJob(db.getId(), stmt.getLabel().getLabelName(),
-                                                            stmt.getBrokerDesc(), stmt.getDataDescriptions());
+                                                            stmt.getBrokerDesc(), stmt.getDataDescriptions(),
+                                                            originStmt);
             brokerLoadJob.setJobProperties(stmt.getProperties());
             brokerLoadJob.setDataSourceInfo(db, stmt.getDataDescriptions());
             return brokerLoadJob;
@@ -173,13 +188,13 @@ public class BrokerLoadJob extends LoadJob {
     @Override
     public void beginTxn() throws LabelAlreadyUsedException, BeginTransactionException, AnalysisException {
         transactionId = Catalog.getCurrentGlobalTransactionMgr()
-                .beginTransaction(dbId, label, -1, "FE: " + FrontendOptions.getLocalHostAddress(),
+                .beginTransaction(dbId, label, null, "FE: " + FrontendOptions.getLocalHostAddress(),
                                   TransactionState.LoadJobSourceType.BATCH_LOAD_JOB, id,
                                   timeoutSecond);
     }
 
     @Override
-    protected void executeJob() {
+    protected void unprotectedExecuteJob() {
         LoadTask task = new BrokerLoadPendingTask(this, dataSourceInfo.getIdToFileGroups(), brokerDesc);
         idToTasks.put(task.getSignature(), task);
         Catalog.getCurrentCatalog().getLoadTaskScheduler().submit(task);
@@ -219,12 +234,18 @@ public class BrokerLoadJob extends LoadJob {
                 return;
             }
             if (loadTask.getRetryTime() <= 0) {
-                executeCancel(failMsg, true);
+                unprotectedExecuteCancel(failMsg, true);
             } else {
                 // retry task
                 idToTasks.remove(loadTask.getSignature());
+                if (loadTask instanceof LoadLoadingTask) {
+                    loadStatistic.numLoadedRowsMap.remove(((LoadLoadingTask) loadTask).getLoadId());
+                }
                 loadTask.updateRetryInfo();
                 idToTasks.put(loadTask.getSignature(), loadTask);
+                if (loadTask instanceof LoadLoadingTask) {
+                    loadStatistic.numLoadedRowsMap.put(((LoadLoadingTask) loadTask).getLoadId(), new AtomicLong(0));
+                }
                 Catalog.getCurrentCatalog().getLoadTaskScheduler().submit(loadTask);
                 return;
             }
@@ -233,6 +254,38 @@ public class BrokerLoadJob extends LoadJob {
         }
 
         logFinalOperation();
+    }
+
+    /**
+     * If the db or table could not be found, the Broker load job will be cancelled.
+     */
+    @Override
+    public void analyze() {
+        if (originStmt == null) {
+            return;
+        }
+        // Reset dataSourceInfo, it will be re-created in analyze
+        dataSourceInfo = new PullLoadSourceInfo();
+        SqlParser parser = new SqlParser(new SqlScanner(new StringReader(originStmt)));
+        LoadStmt stmt = null;
+        try {
+            stmt = (LoadStmt) parser.parse().value;
+            for (DataDescription dataDescription : stmt.getDataDescriptions()) {
+                dataDescription.analyzeWithoutCheckPriv();
+            }
+            Database db = Catalog.getCurrentCatalog().getDb(dbId);
+            if (db == null) {
+                throw new DdlException("Database[" + dbId + "] does not exist");
+            }
+            setDataSourceInfo(db, stmt.getDataDescriptions());
+        } catch (Exception e) {
+            LOG.info(new LogBuilder(LogKey.LOAD_JOB, id)
+                             .add("origin_stmt", originStmt)
+                             .add("msg", "The failure happens in analyze, the load job will be cancelled with error:"
+                                     + e.getMessage())
+                             .build(), e);
+            cancelJobWithoutCheck(new FailMsg(FailMsg.CancelType.LOAD_RUN_FAIL, e.getMessage()), false);
+        }
     }
 
     /**
@@ -304,10 +357,13 @@ public class BrokerLoadJob extends LoadJob {
                 LoadLoadingTask task = new LoadLoadingTask(db, table, brokerDesc,
                                                            entry.getValue(), getDeadlineMs(), execMemLimit,
                                                            strictMode, transactionId, this);
-                task.init(attachment.getFileStatusByTable(tableId),
+                UUID uuid = UUID.randomUUID();
+                TUniqueId loadId = new TUniqueId(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits());
+                task.init(loadId, attachment.getFileStatusByTable(tableId),
                           attachment.getFileNumByTable(tableId));
                 // Add tasks into list and pool
                 idToTasks.put(task.getSignature(), task);
+                loadStatistic.numLoadedRowsMap.put(loadId, new AtomicLong(0));
                 Catalog.getCurrentCatalog().getLoadTaskScheduler().submit(task);
             }
         } finally {
@@ -370,6 +426,10 @@ public class BrokerLoadJob extends LoadJob {
         }
         db.writeLock();
         try {
+            LOG.info(new LogBuilder(LogKey.LOAD_JOB, id)
+                             .add("txn_id", transactionId)
+                             .add("msg", "Load job try to commit txn")
+                             .build());
             Catalog.getCurrentGlobalTransactionMgr().commitTransaction(
                     dbId, transactionId, commitInfos,
                     new LoadJobFinalOperation(id, loadingStatus, progress, loadStartTimestamp,
@@ -377,7 +437,7 @@ public class BrokerLoadJob extends LoadJob {
         } catch (UserException e) {
             LOG.warn(new LogBuilder(LogKey.LOAD_JOB, id)
                              .add("database_id", dbId)
-                             .add("error_msg", "Failed to commit txn.")
+                             .add("error_msg", "Failed to commit txn with error:" + e.getMessage())
                              .build(), e);
             cancelJobWithoutCheck(new FailMsg(FailMsg.CancelType.LOAD_RUN_FAIL, e.getMessage()),true);
             return;
@@ -414,6 +474,12 @@ public class BrokerLoadJob extends LoadJob {
 
     @Override
     protected void executeReplayOnAborted(TransactionState txnState) {
+        if (txnState.getTxnCommitAttachment() == null) {
+            // The txn attachment maybe null when broker load has been cancelled without attachment.
+            // The end log of broker load has been record but the callback id of txnState hasn't been removed
+            // So the callback of txn is executed when log of txn aborted is replayed.
+            return;
+        }
         unprotectReadEndOperation((LoadJobFinalOperation) txnState.getTxnCommitAttachment());
     }
 
@@ -427,13 +493,23 @@ public class BrokerLoadJob extends LoadJob {
         super.write(out);
         brokerDesc.write(out);
         dataSourceInfo.write(out);
+        Text.writeString(out, originStmt);
     }
 
     @Override
     public void readFields(DataInput in) throws IOException {
         super.readFields(in);
         brokerDesc = BrokerDesc.read(in);
+        // The data source info also need to be replayed
+        // because the load properties of old broker load has been saved in here.
         dataSourceInfo.readFields(in);
+
+        if (Catalog.getCurrentCatalogJournalVersion() >= FeMetaVersion.VERSION_58) {
+            originStmt = Text.readString(in);
+        }
+        // The origin stmt does not be analyzed in here.
+        // The reason is that it will thrown MetaNotFoundException when the tableId could not be found by tableName.
+        // The origin stmt will be analyzed after the replay is completed.
     }
 
 }

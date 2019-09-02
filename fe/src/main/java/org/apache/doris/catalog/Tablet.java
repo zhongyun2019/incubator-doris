@@ -26,7 +26,9 @@ import org.apache.doris.common.io.Writable;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
 
+import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
 
 import org.apache.logging.log4j.LogManager;
@@ -49,15 +51,16 @@ public class Tablet extends MetaObject implements Writable {
     
     public enum TabletStatus {
         HEALTHY,
-        REPLICA_MISSING, // not enough alive replica num
-        VERSION_INCOMPLETE, // alive replica num is enough, but version is missing
-        REPLICA_RELOCATING, // replica is healthy, but is under relocating (eg. BE is decommission)
-        REDUNDANT, // too much replicas
-        REPLICA_MISSING_IN_CLUSTER, // not enough healthy replicas in correct cluster
+        REPLICA_MISSING, // not enough alive replica num.
+        VERSION_INCOMPLETE, // alive replica num is enough, but version is missing.
+        REPLICA_RELOCATING, // replica is healthy, but is under relocating (eg. BE is decommission).
+        REDUNDANT, // too much replicas.
+        REPLICA_MISSING_IN_CLUSTER, // not enough healthy replicas in correct cluster.
         FORCE_REDUNDANT, // some replica is missing or bad, but there is no other backends for repair,
                          // at least one replica has to be deleted first to make room for new replica.
         COLOCATE_MISMATCH, // replicas do not all locate in right colocate backends set.
-        COLOCATE_REDUNDANT, // replicas match the colocate backends set, but redundant
+        COLOCATE_REDUNDANT, // replicas match the colocate backends set, but redundant.
+        NEED_FURTHER_REPAIR, // one of replicas need a definite repair.
     }
 
     private long id;
@@ -71,7 +74,7 @@ public class Tablet extends MetaObject implements Writable {
     // last time that the tablet checker checks this tablet.
     // no need to persist
     private long lastStatusCheckTime = -1;
-
+    
     public Tablet() {
         this(0L, new ArrayList<Replica>());
     }
@@ -181,6 +184,24 @@ public class Tablet extends MetaObject implements Writable {
             }
         }
         return beIds;
+    }
+
+    // return map of (BE id -> path hash) of normal replicas
+    public Multimap<Long, Long> getNormalReplicaBackendPathMap() {
+        Multimap<Long, Long> map = HashMultimap.create();
+        SystemInfoService infoService = Catalog.getCurrentSystemInfo();
+        for (Replica replica : replicas) {
+            if (replica.isBad()) {
+                continue;
+            }
+
+            ReplicaState state = replica.getState();
+            if (infoService.checkBackendAlive(replica.getBackendId())
+                    && (state == ReplicaState.NORMAL || state == ReplicaState.SCHEMA_CHANGE)) {
+                map.put(replica.getBackendId(), replica.getPathHash());
+            }
+        }
+        return map;
     }
 
     // for query
@@ -383,12 +404,17 @@ public class Tablet extends MetaObject implements Writable {
         int stable = 0;
         int availableInCluster = 0;
         
+        Replica needFurtherRepairReplica = null;
+        Set<String> hosts = Sets.newHashSet();
         for (Replica replica : replicas) {
-            long backendId = replica.getBackendId();
-            Backend backend = systemInfoService.getBackend(backendId);
+            Backend backend = systemInfoService.getBackend(replica.getBackendId());
             if (backend == null || !backend.isAlive() || replica.getState() == ReplicaState.CLONE
-                    || replica.isBad()) {
-                // this replica is not alive
+                    || replica.getState() == ReplicaState.DECOMMISSION
+                    || replica.isBad() || !hosts.add(backend.getHost())) {
+                // this replica is not alive,
+                // or if this replica is on same host with another replica, we also treat it as 'dead',
+                // so that Tablet Scheduler will create a new replica on different host.
+                // ATTN: Replicas on same host is a bug of previous Doris version, so we fix it by this way.
                 continue;
             }
             alive++;
@@ -411,6 +437,10 @@ public class Tablet extends MetaObject implements Writable {
                 continue;
             }
             availableInCluster++;
+
+            if (replica.needFurtherRepair() && needFurtherRepairReplica == null) {
+                needFurtherRepairReplica = replica;
+            }
         }
 
         // 1. alive replicas are not enough
@@ -422,7 +452,7 @@ public class Tablet extends MetaObject implements Writable {
             // condition explain:
             // 1. alive < replicationNum: replica is missing or bad
             // 2. replicas.size() >= availableBackendsNum: the existing replicas occupies all available backends
-            // 3. availableBackendsNum >= replicationNum: make sure after deleting, there will be a backend for new replica.
+            // 3. availableBackendsNum >= replicationNum: make sure after deleting, there will be at least one backend for new replica.
             // 4. replicationNum > 1: if replication num is set to 1, do not delete any replica, for safety reason
             return Pair.create(TabletStatus.FORCE_REDUNDANT, TabletSchedCtx.Priority.VERY_HIGH);
         } else if (alive < (replicationNum / 2) + 1) {
@@ -437,6 +467,10 @@ public class Tablet extends MetaObject implements Writable {
         } else if (aliveAndVersionComplete < replicationNum) {
             return Pair.create(TabletStatus.VERSION_INCOMPLETE, TabletSchedCtx.Priority.NORMAL);
         } else if (aliveAndVersionComplete > replicationNum) {
+            if (needFurtherRepairReplica != null) {
+                return Pair.create(TabletStatus.NEED_FURTHER_REPAIR, TabletSchedCtx.Priority.HIGH);
+            }
+            // we set REDUNDANT as VERY_HIGH, because delete redundant replicas can free the space quickly.
             return Pair.create(TabletStatus.REDUNDANT, TabletSchedCtx.Priority.VERY_HIGH);
         }
 
@@ -451,6 +485,9 @@ public class Tablet extends MetaObject implements Writable {
         if (availableInCluster < replicationNum) {
             return Pair.create(TabletStatus.REPLICA_MISSING_IN_CLUSTER, TabletSchedCtx.Priority.LOW);
         } else if (replicas.size() > replicationNum) {
+            if (needFurtherRepairReplica != null) {
+                return Pair.create(TabletStatus.NEED_FURTHER_REPAIR, TabletSchedCtx.Priority.HIGH);
+            }
             // we set REDUNDANT as VERY_HIGH, because delete redundant replicas can free the space quickly.
             return Pair.create(TabletStatus.REDUNDANT, TabletSchedCtx.Priority.VERY_HIGH);
         }

@@ -19,7 +19,8 @@
 #define DORIS_BE_SRC_OLAP_MERGER_H
 
 #include "olap/olap_define.h"
-#include "olap/olap_table.h"
+#include "olap/tablet.h"
+#include "olap/rowset/rowset_writer.h"
 
 namespace doris {
 
@@ -29,26 +30,32 @@ class ColumnData;
 class Merger {
 public:
     // parameter index is created by caller, and it is empty.
-    Merger(OLAPTablePtr table, SegmentGroup* index, ReaderType type);
+    Merger(TabletSharedPtr tablet, RowsetWriterSharedPtr writer, ReaderType type);
+    Merger(TabletSharedPtr tablet, ReaderType type, 
+           RowsetWriterSharedPtr writer, const std::vector<RowsetReaderSharedPtr>& rs_readers);
 
     virtual ~Merger() {};
 
     // @brief read from multiple OLAPData and SegmentGroup, then write into single OLAPData and SegmentGroup
     // @return  OLAPStatus: OLAP_SUCCESS or FAIL
     // @note it will take long time to finish.
-    OLAPStatus merge(const std::vector<ColumnData*>& olap_data_arr, 
-                     uint64_t* merged_rows, uint64_t* filted_rows);
+    OLAPStatus merge(const vector<RowsetReaderSharedPtr>& rs_readers,
+                     int64_t* merged_rows, int64_t* filted_rows);
+    OLAPStatus merge();
 
     // 获取在做merge过程中累积的行数
-    uint64_t row_count() {
-        return _row_count;
-    }
+    inline int64_t row_count() const { return _row_count; }
+    inline int64_t merged_rows() const { return _merged_rows; }
+    inline int64_t filted_rows() const { return _filted_rows; }
 private:
-    OLAPTablePtr _table;
-    SegmentGroup* _segment_group;
+    TabletSharedPtr _tablet;
+    RowsetWriterSharedPtr _output_rs_writer;
+
+    std::vector<RowsetReaderSharedPtr> _input_rs_readers;
     ReaderType _reader_type;
-    uint64_t _row_count;
-    Version _simple_merge_version;
+    int64_t _row_count;
+    int64_t _merged_rows;
+    int64_t _filted_rows;
 
     DISALLOW_COPY_AND_ASSIGN(Merger);
 };

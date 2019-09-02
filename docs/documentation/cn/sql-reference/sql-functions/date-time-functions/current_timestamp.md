@@ -1,14 +1,13 @@
 # current_timestamp
-
-## Syntax
+## description
+### Syntax
 
 `DATETIME CURRENT_TIMESTAMP()`
 
-## Description
 
 获得当前的时间，以Datetime类型返回
 
-## Examples
+## example
 
 ```
 mysql> select current_timestamp();
@@ -18,3 +17,7 @@ mysql> select current_timestamp();
 | 2019-05-27 15:59:33 |
 +---------------------+
 ```
+
+## keyword
+
+    CURRENT_TIMESTAMP,CURRENT,TIMESTAMP

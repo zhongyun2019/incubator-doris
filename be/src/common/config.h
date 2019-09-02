@@ -55,9 +55,9 @@ namespace config {
     // the count of heart beat service
     CONF_Int32(heartbeat_service_thread_count, "1");
     // the count of thread to create table
-    CONF_Int32(create_table_worker_count, "3");
+    CONF_Int32(create_tablet_worker_count, "3");
     // the count of thread to drop table
-    CONF_Int32(drop_table_worker_count, "3");
+    CONF_Int32(drop_tablet_worker_count, "3");
     // the count of thread to batch load
     CONF_Int32(push_worker_count_normal_priority, "3");
     // the count of thread to high priority batch load
@@ -71,13 +71,11 @@ namespace config {
     // the count of thread to delete
     CONF_Int32(delete_worker_count, "3");
     // the count of thread to alter table
-    CONF_Int32(alter_table_worker_count, "3");
+    CONF_Int32(alter_tablet_worker_count, "3");
     // the count of thread to clone
     CONF_Int32(clone_worker_count, "3");
     // the count of thread to clone
     CONF_Int32(storage_medium_migrate_count, "1");
-    // the count of thread to cancel delete data
-    CONF_Int32(cancel_delete_data_worker_count, "3");
     // the count of thread to check consistency
     CONF_Int32(check_consistency_worker_count, "1");
     // the count of thread to upload
@@ -93,9 +91,9 @@ namespace config {
     // the interval time(seconds) for agent report disk state to FE
     CONF_Int32(report_disk_state_interval_seconds, "60");
     // the interval time(seconds) for agent report olap table to FE
-    CONF_Int32(report_olap_table_interval_seconds, "60");
+    CONF_Int32(report_tablet_interval_seconds, "60");
     // the timeout(seconds) for alter table
-    CONF_Int32(alter_table_timeout_seconds, "86400");
+    CONF_Int32(alter_tablet_timeout_seconds, "86400");
     // the timeout(seconds) for make snapshot
     CONF_Int32(make_snapshot_timeout_seconds, "600");
     // the timeout(seconds) for release snapshot
@@ -203,29 +201,31 @@ namespace config {
 
     CONF_Int32(file_descriptor_cache_clean_interval, "3600");
     CONF_Int32(disk_stat_monitor_interval, "5");
-    CONF_Int32(unused_index_monitor_interval, "30");
-    CONF_String(storage_root_path, "${DORIS_HOME}/data");
+    CONF_Int32(unused_rowset_monitor_interval, "30");
+    CONF_String(storage_root_path, "${DORIS_HOME}/storage");
     CONF_Int32(min_percentage_of_error_disk, "50");
     CONF_Int32(default_num_rows_per_data_block, "1024");
     CONF_Int32(default_num_rows_per_column_file_block, "1024");
     CONF_Int32(max_tablet_num_per_shard, "1024");
     // pending data policy
     CONF_Int32(pending_data_expire_time_sec, "1800");
-    // incremental delta policy
-    CONF_Int32(incremental_delta_expire_time_sec, "1800");
+    // inc_rowset expired interval
+    CONF_Int32(inc_rowset_expired_sec, "1800");
     // garbage sweep policy
-    CONF_Int32(max_garbage_sweep_interval, "43200");
-    CONF_Int32(min_garbage_sweep_interval, "200");
+    CONF_Int32(max_garbage_sweep_interval, "3600");
+    CONF_Int32(min_garbage_sweep_interval, "180");
     CONF_Int32(snapshot_expire_time_sec, "172800");
     // 仅仅是建议值，当磁盘空间不足时，trash下的文件保存期可不遵守这个参数
     CONF_Int32(trash_file_expire_time_sec, "259200");
-    CONF_Int32(disk_capacity_insufficient_percentage, "90");
     // check row nums for BE/CE and schema change. true is open, false is closed.
     CONF_Bool(row_nums_check, "true")
     //file descriptors cache, by default, cache 30720 descriptors
     CONF_Int32(file_descriptor_cache_capacity, "30720");
     CONF_Int64(index_stream_cache_capacity, "10737418240");
     CONF_Int64(max_packed_row_block_size, "20971520");
+
+    // Cache for stoage page size
+    CONF_String(storage_page_cache_limit, "20G");
 
     // be policy
     CONF_Int64(base_compaction_start_hour, "20");
@@ -261,11 +261,19 @@ namespace config {
     CONF_Int64(load_data_reserve_hours, "4");
     // log error log will be removed after this time
     CONF_Int64(load_error_log_reserve_hours, "48");
+    // Deprecated, use streaming_load_max_mb instead
     CONF_Int64(mini_load_max_mb, "2048");
     CONF_Int32(number_tablet_writer_threads, "16");
 
     CONF_Int64(streaming_load_max_mb, "10240");
-    CONF_Int32(streaming_load_rpc_max_alive_time_sec, "600");
+    // the alive time of a TabletsChannel.
+    // If the channel does not receive any data till this time,
+    // the channel will be removed.
+    CONF_Int32(streaming_load_rpc_max_alive_time_sec, "1200");
+    // the timeout of a rpc to process one batch in tablet writer.
+    // you may need to increase this timeout if using larger 'streaming_load_max_mb',
+    // or encounter 'tablet writer write failed' error when loading.
+    CONF_Int32(tablet_writer_rpc_timeout_sec, "600");
 
     // Fragment thread pool
     CONF_Int32(fragment_pool_thread_num, "64");
@@ -408,6 +416,14 @@ namespace config {
     // If this configuration is set to true, block will seek position.
     CONF_Bool(block_seek_position, "false");
 
+    // max external scan cache batch count, means cache max_memory_cache_batch_count * batch_size row
+    // default is 10, batch_size's defualt value is 1024 means 10 * 1024 rows will be cached
+    CONF_Int32(max_memory_sink_batch_count, "20");
+    
+    // This configuration is used for the context gc thread schedule period
+    // note: unit is minute, default is 5min
+    CONF_Int32(scan_context_gc_interval_min, "5");
+
     // the max client cache number per each host
     // There are variety of client cache in BE, but currently we use the
     // same cache size configuration.
@@ -416,6 +432,19 @@ namespace config {
 
     // Dir to save files downloaded by SmallFileMgr
     CONF_String(small_file_dir, "${DORIS_HOME}/lib/small_file/");
+    // path gc
+    CONF_Bool(path_gc_check, "true");
+    CONF_Int32(path_gc_check_interval_second, "86400");
+    CONF_Int32(path_gc_check_step, "1000");
+    CONF_Int32(path_gc_check_step_interval_ms, "10");
+    CONF_Int32(path_scan_interval_second, "86400");
+
+    // The following 2 configs limit the max usage of disk capacity of a data dir.
+    // If both of these 2 threshold reached, no more data can be writen into that data dir.
+    // The percent of max used capacity of a data dir
+    CONF_Int32(storage_flood_stage_usage_percent, "95");    // 95%
+    // The min bytes that should be left of a data dir
+    CONF_Int64(storage_flood_stage_left_capacity_bytes, "1073741824")   // 1GB
 } // namespace config
 
 } // namespace doris

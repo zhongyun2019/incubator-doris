@@ -111,14 +111,14 @@ public class DdlExecutor {
             } else {
                 if (Config.disable_hadoop_load) {
                     throw new DdlException("Load job by hadoop cluster is disabled."
-                            + " Try use broker load. See 'help broker load;'");
+                            + " Try using broker load. See 'help broker load;'");
                 }
                 jobType = EtlJobType.HADOOP;
             }
             if (loadStmt.getVersion().equals(Load.VERSION) || loadStmt.getBrokerDesc() == null) {
                 catalog.getLoadManager().createLoadJobV1FromStmt(loadStmt, jobType, System.currentTimeMillis());
             } else {
-                catalog.getLoadManager().createLoadJobFromStmt(loadStmt);
+                catalog.getLoadManager().createLoadJobFromStmt(loadStmt, origStmt);
             }
         } else if (ddlStmt instanceof CancelLoadStmt) {
             if (catalog.getLoadInstance().isLabelExist(

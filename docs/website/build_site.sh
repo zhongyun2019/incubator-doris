@@ -75,15 +75,11 @@ if [[ ${HELP} -eq 1 ]]; then
 fi
 
 
-if [ ${BUILD_CN} -eq 1 ] ; then
-    rm -rf ${CUR}/source/Docs/*
-    rm -rf ${CUR}/source/resources/
-    cp -r ${DORIS_HOME}/docs/documentation/cn/ ${CUR}/source/Docs/
-    cp -r ${DORIS_HOME}/docs/resources/ ${CUR}/source/
-
-    make clean && make html
-elif [ ${BUILD_EN} -eq 1 ] ; then
-    echo "not implemented yet"
-    exit 1
-fi
+rm -rf ${CUR}/source/documentation/
+rm -rf ${CUR}/source/resources/
+mkdir -p ${CUR}/source/documentation
+mkdir -p ${CUR}/source/resources
+cp -r ${DORIS_HOME}/docs/documentation/* ${CUR}/source/documentation/
+cp -r ${DORIS_HOME}/docs/resources/* ${CUR}/source/resources/
+make clean && make html
 

@@ -76,6 +76,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.apache.doris.catalog.AggregateType.BITMAP_UNION;
+
 public class SchemaChangeHandler extends AlterHandler {
     private static final Logger LOG = LogManager.getLogger(SchemaChangeHandler.class);
 
@@ -97,7 +99,7 @@ public class SchemaChangeHandler extends AlterHandler {
         String baseIndexName = olapTable.getName();
         checkAssignedTargetIndexName(baseIndexName, targetIndexName);
 
-        long baseIndexId = olapTable.getId();
+        long baseIndexId = olapTable.getBaseIndexId();
         long targetIndexId = -1L;
         if (targetIndexName != null) {
             targetIndexId = olapTable.getIndexIdByName(targetIndexName);
@@ -125,7 +127,7 @@ public class SchemaChangeHandler extends AlterHandler {
         String baseIndexName = olapTable.getName();
         checkAssignedTargetIndexName(baseIndexName, targetIndexName);
 
-        long baseIndexId = olapTable.getId();
+        long baseIndexId = olapTable.getBaseIndexId();
         long targetIndexId = -1L;
         if (targetIndexName != null) {
             targetIndexId = olapTable.getIndexIdByName(targetIndexName);
@@ -152,7 +154,7 @@ public class SchemaChangeHandler extends AlterHandler {
         checkAssignedTargetIndexName(baseIndexName, targetIndexName);
         
         if (KeysType.UNIQUE_KEYS == olapTable.getKeysType()) {
-            long baseIndexId = olapTable.getId();
+            long baseIndexId = olapTable.getBaseIndexId();
             List<Column> baseSchema = indexSchemaMap.get(baseIndexId);
             boolean isKey = false;
             for (Column column : baseSchema) {
@@ -169,7 +171,7 @@ public class SchemaChangeHandler extends AlterHandler {
         } else if (KeysType.AGG_KEYS == olapTable.getKeysType()) {
             if (null == targetIndexName) {
                 // drop column in base table
-                long baseIndexId = olapTable.getId();
+                long baseIndexId = olapTable.getBaseIndexId();
                 List<Column> baseSchema = indexSchemaMap.get(baseIndexId);
                 boolean isKey = false;
                 boolean hasReplaceColumn = false;
@@ -203,7 +205,7 @@ public class SchemaChangeHandler extends AlterHandler {
             }
         }
         
-        long baseIndexId = olapTable.getId();
+        long baseIndexId = olapTable.getBaseIndexId();
         if (targetIndexName == null) {
             // drop base index and all rollup indices's column
             List<Long> indexIds = new ArrayList<Long>();
@@ -521,6 +523,10 @@ public class SchemaChangeHandler extends AlterHandler {
             throw new DdlException("HLL must be used in AGG_KEYS");
         }
 
+        if (newColumn.getAggregationType() == BITMAP_UNION  && KeysType.AGG_KEYS != olapTable.getKeysType()) {
+            throw new DdlException("BITMAP_UNION must be used in AGG_KEYS");
+        }
+
         List<Column> baseSchema = olapTable.getBaseSchema();
         String newColName = newColumn.getName();
         boolean found = false;
@@ -732,7 +738,7 @@ public class SchemaChangeHandler extends AlterHandler {
         Set<String> bfColumns = null;
         double bfFpp = 0;
         try {
-            bfColumns = PropertyAnalyzer.analyzeBloomFilterColumns(propertyMap, indexSchemaMap.get(olapTable.getId()));
+            bfColumns = PropertyAnalyzer.analyzeBloomFilterColumns(propertyMap, indexSchemaMap.get(olapTable.getBaseIndexId()));
             bfFpp = PropertyAnalyzer.analyzeBloomFilterFpp(propertyMap);
         } catch (AnalysisException e) {
             throw new DdlException(e.getMessage());
@@ -927,7 +933,7 @@ public class SchemaChangeHandler extends AlterHandler {
                             break;
                         }
                     } // end for alterColumns
-                    if (!found && alterIndexId == tableId) {
+                    if (!found && alterIndexId == olapTable.getBaseIndexId()) {
                         // 2.1 partition column cannot be deleted.
                         throw new DdlException("Partition column[" + partitionCol.getName()
                                 + "] cannot be dropped. index[" + olapTable.getIndexNameById(alterIndexId) + "]");
@@ -955,7 +961,7 @@ public class SchemaChangeHandler extends AlterHandler {
                             break;
                         }
                     } // end for alterColumns
-                    if (!found && alterIndexId == tableId) {
+                    if (!found && alterIndexId == olapTable.getBaseIndexId()) {
                         // 2.2 distribution column cannot be deleted.
                         throw new DdlException("Distribution column[" + distributionCol.getName()
                                 + "] cannot be dropped. index[" + olapTable.getIndexNameById(alterIndexId) + "]");
@@ -973,6 +979,7 @@ public class SchemaChangeHandler extends AlterHandler {
                     int replicaNum = 0;
                     for (Replica replica : tablet.getReplicas()) {
                         if (replica.getState() == ReplicaState.CLONE 
+                                || replica.getState() == ReplicaState.DECOMMISSION
                                 || replica.getLastFailedVersion() > 0) {
                             // just skip it (replica cloned from old schema will be deleted)
                             continue;
@@ -1052,7 +1059,9 @@ public class SchemaChangeHandler extends AlterHandler {
                 // set replica state
                 for (Tablet tablet : alterIndex.getTablets()) {
                     for (Replica replica : tablet.getReplicas()) {
-                        if (replica.getState() == ReplicaState.CLONE || replica.getLastFailedVersion() > 0) {
+                        if (replica.getState() == ReplicaState.CLONE 
+                                || replica.getState() == ReplicaState.DECOMMISSION
+                                || replica.getLastFailedVersion() > 0) {
                             // this should not happen, cause we only allow schema change when table is stable.
                             LOG.error("replica {} of tablet {} on backend {} is not NORMAL: {}",
                                     replica.getId(), tablet.getId(), replica.getBackendId(), replica);

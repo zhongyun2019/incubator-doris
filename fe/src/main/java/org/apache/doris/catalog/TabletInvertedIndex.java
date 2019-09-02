@@ -34,6 +34,7 @@ import com.google.common.collect.HashBasedTable;
 import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.common.collect.SetMultimap;
 import com.google.common.collect.Table;
 
 import org.apache.logging.log4j.LogManager;
@@ -108,14 +109,22 @@ public class TabletInvertedIndex {
                              Set<Long> foundTabletsWithValidSchema,
                              Map<Long, TTabletInfo> foundTabletsWithInvalidSchema,
                              ListMultimap<TStorageMedium, Long> tabletMigrationMap, 
-                             Map<Long, ListMultimap<Long, TPartitionVersionInfo>> transactionsToPublish, 
-                             ListMultimap<Long, Long> transactionsToClear, 
-                             ListMultimap<Long, Long> tabletRecoveryMap) {
+                             Map<Long, ListMultimap<Long, TPartitionVersionInfo>> transactionsToPublish,
+                             ListMultimap<Long, Long> transactionsToClear,
+                             ListMultimap<Long, Long> tabletRecoveryMap,
+                             SetMultimap<Long, Integer> tabletWithoutPartitionId) {
         long start = 0L;
         readLock();
         try {
             LOG.info("begin to do tablet diff with backend[{}]. num: {}", backendId, backendTablets.size());
             start = System.currentTimeMillis();
+            for (TTablet backendTablet : backendTablets.values()) {
+                for (TTabletInfo tabletInfo : backendTablet.tablet_infos) {
+                    if (!tabletInfo.isSetPartition_id() || tabletInfo.getPartition_id() < 1) {
+                        tabletWithoutPartitionId.put(tabletInfo.getTablet_id(), tabletInfo.getSchema_hash());
+                    }
+                }
+            }
             Map<Long, Replica> replicaMetaWithBackend = backingReplicaMetaTable.row(backendId);
             if (replicaMetaWithBackend != null) {
                 // traverse replicas in meta with this backend
@@ -186,6 +195,10 @@ public class TabletInvertedIndex {
                                         } else if (transactionState.getTransactionStatus() == TransactionStatus.VISIBLE) {
                                             TableCommitInfo tableCommitInfo = transactionState.getTableCommitInfo(tabletMeta.getTableId());
                                             PartitionCommitInfo partitionCommitInfo = tableCommitInfo.getPartitionCommitInfo(partitionId);
+                                            if (partitionCommitInfo == null) {
+                                                LOG.warn("failed to find partition commit info. table: {}, partition: {}, tablet: {}, txn id: {}",
+                                                        tabletMeta.getTableId(), partitionId, tabletId, transactionState.getTransactionId());
+                                            }
                                             TPartitionVersionInfo versionInfo = new TPartitionVersionInfo(tabletMeta.getPartitionId(), 
                                                     partitionCommitInfo.getVersion(),
                                                     partitionCommitInfo.getVersionHash());
@@ -336,11 +349,17 @@ public class TabletInvertedIndex {
         }
         long versionInFe = replicaInFe.getVersion();
         long versionHashInFe = replicaInFe.getVersionHash();
+        
         if (backendTabletInfo.getVersion() > versionInFe
-                || (versionInFe == backendTabletInfo.getVersion()
-                        && versionHashInFe != backendTabletInfo.getVersion_hash())) {
+                || (versionInFe == backendTabletInfo.getVersion() && versionHashInFe != backendTabletInfo.getVersion_hash())) {
+            // backend replica's version is larger or newer than replica in FE, sync it.
+            return true;
+        } else if (versionInFe == backendTabletInfo.getVersion() && versionHashInFe == backendTabletInfo.getVersion_hash()
+                && replicaInFe.isBad()) {
+            // backend replica's version is equal to replica in FE, but replica in FE is bad, while backend replica is good, sync it
             return true;
         }
+        
         return false;
     }
     
@@ -385,12 +404,10 @@ public class TabletInvertedIndex {
             return false;
         }
 
-        if (backendTabletInfo.getVersion() < replicaInFe.getVersion()
-                && backendTabletInfo.isSetVersion_miss() && backendTabletInfo.isVersion_miss()) {
+        if (backendTabletInfo.isSetVersion_miss() && backendTabletInfo.isVersion_miss()) {
             // even if backend version is less than fe's version, but if version_miss is false,
             // which means this may be a stale report.
             // so we only return true if version_miss is true.
-            LOG.info("replicaversion missing");
             return true;
         }
         return false;

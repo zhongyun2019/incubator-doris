@@ -48,6 +48,7 @@ import org.apache.doris.catalog.AggregateType;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.MysqlTable;
 import org.apache.doris.catalog.Table;
+import org.apache.doris.catalog.FunctionSet;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.Reference;
@@ -395,7 +396,7 @@ public class SingleNodePlanner {
                     if (!slot.getColumn().isKey()) {
                         if (conjunctSlotIds.contains(slot.getId())) {
                             turnOffReason = "conjunct on " + slot.getColumn().getName() +
-                                    " which is OlapEngine value column";
+                                    " which is StorageEngine value column";
                             valueColumnValidate = false;
                             break;
                         }
@@ -502,7 +503,7 @@ public class SingleNodePlanner {
                         if (aggExpr.getFnName().getFunction().equalsIgnoreCase("MAX")
                                 && aggExpr.getFnName().getFunction().equalsIgnoreCase("MIN")) {
                             returnColumnValidate = false;
-                            turnOffReason = "the type of agg on OlapEngine's Key column should only be MAX or MIN."
+                            turnOffReason = "the type of agg on StorageEngine's Key column should only be MAX or MIN."
                                     + "agg expr: " + aggExpr.toSql();
                             break;
                         }
@@ -533,6 +534,18 @@ public class SingleNodePlanner {
                     } else if (aggExpr.getFnName().getFunction().equalsIgnoreCase("NDV")) {
                         if ((!col.isKey())) {
                             turnOffReason = "NDV function with non-key column: " + col.getName();
+                            returnColumnValidate = false;
+                            break;
+                        }
+                    } else if (aggExpr.getFnName().getFunction().equalsIgnoreCase(FunctionSet.BITMAP_UNION_INT)) {
+                        if ((!col.isKey())) {
+                            turnOffReason = "BITMAP_UNION_INT function with non-key column: " + col.getName();
+                            returnColumnValidate = false;
+                            break;
+                        }
+                    } else if (aggExpr.getFnName().getFunction().equalsIgnoreCase(FunctionSet.BITMAP_UNION)) {
+                        if (col.getAggregationType() != AggregateType.BITMAP_UNION) {
+                            turnOffReason = "Aggregate Operator not match: BITMAP_UNION <--> " + col.getAggregationType();
                             returnColumnValidate = false;
                             break;
                         }
@@ -568,7 +581,7 @@ public class SingleNodePlanner {
                 for (SlotDescriptor slot : selectStmt.getTableRefs().get(0).getDesc().getSlots()) {
                     if (!slot.getColumn().isKey()) {
                         if (groupSlotIds.contains(slot.getId())) {
-                            turnOffReason = "groupExpr contains OlapEngine's Value";
+                            turnOffReason = "groupExpr contains StorageEngine's Value";
                             groupExprValidate = false;
                             break;
                         }

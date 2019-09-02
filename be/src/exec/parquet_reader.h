@@ -37,7 +37,6 @@
 #include "gen_cpp/PaloBrokerService_types.h"
 #include "gen_cpp/PlanNodes_types.h"
 
-
 namespace doris {
 
 class ExecEnv;
@@ -69,7 +68,7 @@ private:
 // Reader of broker parquet file
 class ParquetReaderWrap {
 public:
-    ParquetReaderWrap(FileReader *file_reader);
+    ParquetReaderWrap(FileReader *file_reader, int32_t num_of_columns_from_file);
     virtual ~ParquetReaderWrap();
 
     // Read 
@@ -86,6 +85,7 @@ private:
     Status handle_timestamp(const std::shared_ptr<arrow::TimestampArray>& ts_array, uint8_t *buf, int32_t *wbtyes);
 
 private:
+    const int32_t _num_of_columns_from_file;
     parquet::ReaderProperties _properties;
     std::shared_ptr<ParquetFile> _parquet;
 

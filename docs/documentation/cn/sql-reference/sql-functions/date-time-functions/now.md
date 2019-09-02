@@ -1,14 +1,13 @@
 # now
-
-## Syntax
+## description
+### Syntax
 
 `DATETIME NOW()`
 
-## Description
 
 获得当前的时间，以Datetime类型返回
 
-## Examples
+## example
 
 ```
 mysql> select now();
@@ -18,3 +17,7 @@ mysql> select now();
 | 2019-05-27 15:58:25 |
 +---------------------+
 ```
+
+##keyword
+
+    NOW

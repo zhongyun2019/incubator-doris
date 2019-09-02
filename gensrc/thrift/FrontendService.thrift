@@ -367,6 +367,8 @@ struct TReportExecStatusParams {
   13: optional list<string> export_files 
 
   14: optional list<Types.TTabletCommitInfo> commitInfos
+
+  15: optional i64 loaded_rows
 }
 
 struct TFeResult {
@@ -407,6 +409,7 @@ struct TMasterOpRequest {
     6: optional i64 execMemLimit
     7: optional i32 queryTimeout
     8: optional string user_ip
+    9: optional string time_zone
 }
 
 struct TColumnDefinition {
@@ -455,7 +458,8 @@ struct TMiniLoadBeginRequest {
     9: optional i64 timeout_second
     10: optional double max_filter_ratio 
     11: optional i64 auth_code
-    12: optional i64 create_timestamp;
+    12: optional i64 create_timestamp
+    13: optional Types.TUniqueId request_id
 }
 
 struct TIsMethodSupportedRequest {
@@ -481,9 +485,11 @@ struct TLoadTxnBeginRequest {
     5: required string tbl
     6: optional string user_ip
     7: required string label
-    8: optional i64 timestamp
+    8: optional i64 timestamp   // deprecated, use request_id instead
     9: optional i64 auth_code
+    // The real value of timeout should be i32. i64 ensures the compatibility of interface.
     10: optional i64 timeout
+    11: optional Types.TUniqueId request_id
 }
 
 struct TLoadTxnBeginResult {
@@ -521,6 +527,8 @@ struct TStreamLoadPutRequest {
     15: optional string partitions
     16: optional i64 auth_code
     17: optional bool negative
+    18: optional i32 timeout
+    19: optional bool strictMode
 }
 
 struct TStreamLoadPutResult {

@@ -44,6 +44,7 @@ import org.apache.doris.persist.EditLog;
 import org.apache.doris.task.AgentTaskQueue;
 import org.apache.doris.task.PublishVersionTask;
 import org.apache.doris.thrift.TTaskType;
+import org.apache.doris.thrift.TUniqueId;
 import org.apache.doris.transaction.TransactionState.LoadJobSourceType;
 
 import com.google.common.base.Joiner;
@@ -107,22 +108,22 @@ public class GlobalTransactionMgr {
 
     public long beginTransaction(long dbId, String label, String coordinator, LoadJobSourceType sourceType,
             long timeoutSecond) throws AnalysisException, LabelAlreadyUsedException, BeginTransactionException {
-        return beginTransaction(dbId, label, -1, coordinator, sourceType, -1, timeoutSecond);
+        return beginTransaction(dbId, label, null, coordinator, sourceType, -1, timeoutSecond);
     }
     
     /**
      * the app could specify the transaction id
      * 
-     * timestamp is used to judge that whether the request is a internal retry request
-     * if label already exist, and timestamp are equal, we return the exist tid, and consider this 'begin'
+     * requestId is used to judge that whether the request is a internal retry request
+     * if label already exist, and requestId are equal, we return the exist tid, and consider this 'begin'
      * as success.
-     * timestamp == -1 is for compatibility
+     * requestId == null is for compatibility
      *
      * @param coordinator
      * @throws BeginTransactionException
      * @throws IllegalTransactionParameterException
      */
-    public long beginTransaction(long dbId, String label, long timestamp,
+    public long beginTransaction(long dbId, String label, TUniqueId requestId,
             String coordinator, LoadJobSourceType sourceType, long listenerId, long timeoutSecond)
             throws AnalysisException, LabelAlreadyUsedException, BeginTransactionException {
         
@@ -130,10 +131,10 @@ public class GlobalTransactionMgr {
             throw new AnalysisException("disable_load_job is set to true, all load jobs are prevented");
         }
         
-        if (timeoutSecond > Config.max_stream_load_timeout_second ||
-                timeoutSecond < Config.min_stream_load_timeout_second) {
+        if (timeoutSecond > Config.max_load_timeout_second ||
+                timeoutSecond < Config.min_load_timeout_second) {
             throw new AnalysisException("Invalid timeout. Timeout should between "
-                    + Config.min_stream_load_timeout_second + " and " + Config.max_stream_load_timeout_second
+                    + Config.min_load_timeout_second + " and " + Config.max_load_timeout_second
                     + " seconds");
         }
         
@@ -145,10 +146,11 @@ public class GlobalTransactionMgr {
             Map<String, Long> txnLabels = dbIdToTxnLabels.row(dbId);
             if (txnLabels != null && txnLabels.containsKey(label)) {
                 // check timestamp
-                if (timestamp != -1) {
+                if (requestId != null) {
                     TransactionState existTxn = getTransactionState(txnLabels.get(label));
                     if (existTxn != null && existTxn.getTransactionStatus() == TransactionStatus.PREPARE
-                            && existTxn.getTimestamp() == timestamp) {
+                            && existTxn.getRequsetId() != null && existTxn.getRequsetId().equals(requestId)) {
+                        // this may be a retry request for same job, just return existing txn id.
                         return txnLabels.get(label);
                     }
                 }
@@ -161,7 +163,7 @@ public class GlobalTransactionMgr {
             }
             long tid = idGenerator.getNextTransactionId();
             LOG.info("begin transaction: txn id {} with label {} from coordinator {}", tid, label, coordinator);
-            TransactionState transactionState = new TransactionState(dbId, tid, label, timestamp, sourceType,
+            TransactionState transactionState = new TransactionState(dbId, tid, label, requestId, sourceType,
                     coordinator, listenerId, timeoutSecond * 1000);
             transactionState.setPrepareTime(System.currentTimeMillis());
             unprotectUpsertTransactionState(transactionState);
@@ -251,7 +253,8 @@ public class GlobalTransactionMgr {
         TransactionState transactionState = idToTransactionState.get(transactionId);
         if (transactionState == null
                 || transactionState.getTransactionStatus() == TransactionStatus.ABORTED) {
-            throw new TransactionCommitFailedException(transactionState.getReason());
+            throw new TransactionCommitFailedException(
+                    transactionState == null ? "transaction not found" : transactionState.getReason());
         }
 
         if (transactionState.getTransactionStatus() == TransactionStatus.VISIBLE) {
@@ -275,14 +278,17 @@ public class GlobalTransactionMgr {
         Map<Long, Set<Long>> tableToPartition = new HashMap<>();
         // 2. validate potential exists problem: db->table->partition
         // guarantee exist exception during a transaction
-        // if table or partition is dropped during load, the job is fail
-        // if index is dropped, it does not matter
+        // if index is dropped, it does not matter.
+        // if table or partition is dropped during load, just ignore that tablet,
+        // because we should allow dropping rollup or partition during load
         for (TabletCommitInfo tabletCommitInfo : tabletCommitInfos) {
             long tabletId = tabletCommitInfo.getTabletId();
             long tableId = tabletInvertedIndex.getTableId(tabletId);
             OlapTable tbl = (OlapTable) db.getTable(tableId);
             if (tbl == null) {
-                throw new MetaNotFoundException("could not find table for tablet [" + tabletId + "]");
+                // this can happen when tableId == -1 (tablet being dropping)
+                // or table really not exist.
+                continue;
             }
 
             if (tbl.getState() == OlapTableState.RESTORE) {
@@ -292,7 +298,9 @@ public class GlobalTransactionMgr {
 
             long partitionId = tabletInvertedIndex.getPartitionId(tabletId);
             if (tbl.getPartition(partitionId) == null) {
-                throw new MetaNotFoundException("could not find partition for tablet [" + tabletId + "]");
+                // this can happen when partitionId == -1 (tablet being dropping)
+                // or partition really not exist.
+                continue;
             }
 
             if (!tableToPartition.containsKey(tableId)) {
@@ -305,6 +313,11 @@ public class GlobalTransactionMgr {
             tabletToBackends.get(tabletId).add(tabletCommitInfo.getBackendId());
         }
         
+        if (tableToPartition.isEmpty()) {
+            // table or all partitions are being dropped
+            throw new TransactionCommitFailedException(TransactionCommitFailedException.NO_DATA_TO_LOAD_MSG);
+        }
+
         Set<Long> errorReplicaIds = Sets.newHashSet();
         Set<Long> totalInvolvedBackends = Sets.newHashSet();
         for (long tableId : tableToPartition.keySet()) {
@@ -359,6 +372,9 @@ public class GlobalTransactionMgr {
                         Set<Long> tabletBackends = tablet.getBackendIds();
                         totalInvolvedBackends.addAll(tabletBackends);
                         Set<Long> commitBackends = tabletToBackends.get(tabletId);
+                        // save the error replica ids for current tablet
+                        // this param is used for log
+                        Set<Long> errorBackendIdsForTablet = Sets.newHashSet();
                         for (long tabletBackend : tabletBackends) {
                             Replica replica = tabletInvertedIndex.getReplica(tabletId, tabletBackend);
                             if (replica == null) {
@@ -386,16 +402,21 @@ public class GlobalTransactionMgr {
                                     }
                                 }
                             } else {
+                                errorBackendIdsForTablet.add(tabletBackend);
                                 errorReplicaIds.add(replica.getId());
                                 // not remove rollup task here, because the commit maybe failed
                                 // remove rollup task when commit successfully
                             }
                         }
                         if (index.getState() != IndexState.ROLLUP && successReplicaNum < quorumReplicaNum) {
-                            // not throw exception here, wait the upper application retry
-                            LOG.info("Index [{}] success replica num is {} < quorum replica num {}",
-                                     index, successReplicaNum, quorumReplicaNum);
-                            return;
+                            LOG.warn("Failed to commit txn []. "
+                                             + "Tablet [{}] success replica num is {} < quorum replica num {} "
+                                             + "while error backends {}",
+                                     transactionId, tablet.getId(), successReplicaNum, quorumReplicaNum,
+                                     Joiner.on(",").join(errorBackendIdsForTablet));
+                            throw new TabletQuorumFailedException(transactionId, tablet.getId(),
+                                                                  successReplicaNum, quorumReplicaNum,
+                                                                  errorBackendIdsForTablet);
                         }
                     }
                 }
@@ -757,8 +778,8 @@ public class GlobalTransactionMgr {
                     continue;
                 }
                 if (entry.getKey() <= endTransactionId) {
-                    LOG.info("txn is still running: {}, checking end txn id: {}",
-                            entry.getValue(), endTransactionId);
+                    LOG.debug("find a running txn with txn_id={}, less than schema change txn_id {}", 
+                            entry.getKey(), endTransactionId);
                     return false;
                 }
             }

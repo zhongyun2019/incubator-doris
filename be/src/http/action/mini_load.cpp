@@ -112,6 +112,7 @@ const std::string COLUMNS_KEY = "columns";
 const std::string HLL_KEY = "hll";
 const std::string COLUMN_SEPARATOR_KEY = "column_separator";
 const std::string MAX_FILTER_RATIO_KEY = "max_filter_ratio";
+const std::string STRICT_MODE_KEY = "strict_mode";
 const std::string TIMEOUT_KEY = "timeout";
 const char* k_100_continue = "100-continue";
 
@@ -397,7 +398,7 @@ bool MiniLoadAction::_is_streaming(HttpRequest* req) {
 
 Status MiniLoadAction::_on_header(HttpRequest* req) {
     size_t body_bytes = 0;
-    size_t max_body_bytes = config::mini_load_max_mb * 1024 * 1024;
+    size_t max_body_bytes = config::streaming_load_max_mb * 1024 * 1024;
     if (!req->header(HttpHeaders::CONTENT_LENGTH).empty()) {
         body_bytes = std::stol(req->header(HttpHeaders::CONTENT_LENGTH));
         if (body_bytes > max_body_bytes) {
@@ -647,6 +648,7 @@ Status MiniLoadAction::_begin_mini_load(StreamLoadContext* ctx) {
         request.__set_max_filter_ratio(ctx->max_filter_ratio);
     }
     request.__set_create_timestamp(UnixMillis());
+    request.__set_request_id(ctx->id.to_thrift());
     // begin load by master
     const TNetworkAddress& master_addr = _exec_env->master_info()->network_address;
     TMiniLoadBeginResult res;
@@ -664,6 +666,7 @@ Status MiniLoadAction::_begin_mini_load(StreamLoadContext* ctx) {
     ctx->txn_id = res.txn_id;
     // txn has been begun in fe
     ctx->need_rollback = true;
+    LOG(INFO) << "load:" << ctx->label << " txn:" << res.txn_id << " has been begun in fe";
     return Status::OK();
 }
 
@@ -709,6 +712,20 @@ Status MiniLoadAction::_process_put(HttpRequest* req, StreamLoadContext* ctx) {
     if (column_separator_it != params.end()) {
         put_request.__set_columnSeparator(column_separator_it->second);
     }
+    if (ctx->timeout_second != -1) {
+        put_request.__set_timeout(ctx->timeout_second);
+    }
+    auto strict_mode_it = params.find(STRICT_MODE_KEY);
+    if (strict_mode_it != params.end()) {
+        std::string strict_mode_value = strict_mode_it->second;
+        if (boost::iequals(strict_mode_value, "false")) {
+            put_request.__set_strictMode(false);
+        } else if (boost::iequals(strict_mode_value, "true")) {
+            put_request.__set_strictMode(true);
+        } else {
+            return Status::InvalidArgument("Invalid strict mode format. Must be bool type");
+        }
+    }
 
     // plan this load
     TNetworkAddress master_addr = _exec_env->master_info()->network_address;
@@ -729,7 +746,7 @@ Status MiniLoadAction::_process_put(HttpRequest* req, StreamLoadContext* ctx) {
 // new on_header of mini load
 Status MiniLoadAction::_on_new_header(HttpRequest* req) {
     size_t body_bytes = 0;
-    size_t max_body_bytes = config::mini_load_max_mb * 1024 * 1024;
+    size_t max_body_bytes = config::streaming_load_max_mb * 1024 * 1024;
     if (!req->header(HttpHeaders::CONTENT_LENGTH).empty()) {
         body_bytes = std::stol(req->header(HttpHeaders::CONTENT_LENGTH));
         if (body_bytes > max_body_bytes) {
@@ -773,7 +790,11 @@ Status MiniLoadAction::_on_new_header(HttpRequest* req) {
     }
     auto timeout_it = params.find(TIMEOUT_KEY);
     if (timeout_it != params.end()) {
-        ctx->timeout_second = std::stoi(timeout_it->second);
+        try {
+            ctx->timeout_second = std::stoi(timeout_it->second);
+        } catch (const std::invalid_argument& e) {
+            return Status::InvalidArgument("Invalid timeout format");
+        }
     }
     
     LOG(INFO) << "new income mini load request." << ctx->brief()
@@ -806,12 +827,12 @@ void MiniLoadAction::_new_handle(HttpRequest* req) {
         }
     }
 
-    if (!ctx->status.ok()) {
+    // if failed to commit and status is not PUBLISH_TIMEOUT, rollback the txn.
+    // PUBLISH_TIMEOUT is treated as OK in mini load, because user will use show load stmt
+    // to see the final result.
+    if (!ctx->status.ok() && ctx->status.code() != TStatusCode::PUBLISH_TIMEOUT) {
         if (ctx->need_rollback) {
             _exec_env->stream_load_executor()->rollback_txn(ctx);
-            if (ctx->status.code() == TStatusCode::PUBLISH_TIMEOUT) {
-                ctx->status = Status::PublishTimeout("transation has been rollback because it was timeout in phase of publish");    
-            }
             ctx->need_rollback = false;
         }
         if (ctx->body_sink.get() != nullptr) {
@@ -819,7 +840,7 @@ void MiniLoadAction::_new_handle(HttpRequest* req) {
         }
     }
 
-    std::string str = to_json(ctx->status);
+    std::string str = ctx->to_json_for_mini_load();
     HttpChannel::send_reply(req, str);
 }
 

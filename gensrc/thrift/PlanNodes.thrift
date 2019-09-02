@@ -112,6 +112,12 @@ struct TBrokerRangeDesc {
     6: required i64 size
     // used to get stream for this load
     7: optional Types.TUniqueId load_id
+    // total size of the file
+    8: optional i64 file_size
+    // number of columns from file
+    9: optional i32 num_of_columns_from_file = 0
+    // columns parsed from file path should be after the columns read from file
+    10: optional list<string> columns_from_path
 }
 
 struct TBrokerScanRangeParams {
@@ -321,6 +327,7 @@ enum TAggregationOp {
   ROW_NUMBER,
   LAG,
   HLL_C, 
+  BITMAP_UNION,
 }
 
 //struct TAggregateFunctionCall {

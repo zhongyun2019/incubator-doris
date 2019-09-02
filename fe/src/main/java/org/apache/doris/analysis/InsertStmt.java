@@ -17,10 +17,12 @@
 
 package org.apache.doris.analysis;
 
+import org.apache.doris.catalog.AggregateType;
 import org.apache.doris.catalog.BrokerTable;
 import org.apache.doris.catalog.Catalog;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
+import org.apache.doris.catalog.FunctionSet;
 import org.apache.doris.catalog.MysqlTable;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
@@ -340,7 +342,7 @@ public class InsertStmt extends DdlStmt {
             if (mentionedCols.contains(col.getName())) {
                 continue;
             }
-            if (col.getDefaultValue() == null) {
+            if (col.getDefaultValue() == null && !col.isAllowNull()) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_COL_NOT_MENTIONED, col.getName());
             }
         }
@@ -400,6 +402,11 @@ public class InsertStmt extends DdlStmt {
                     Expr expr = queryStmt.getResultExprs().get(i);
                     checkHllCompatibility(column, expr);
                 }
+
+                if (column.getAggregationType() == AggregateType.BITMAP_UNION) {
+                    Expr expr = queryStmt.getResultExprs().get(i);
+                    checkBitmapCompatibility(column, expr);
+                }
             }
         }
     }
@@ -417,6 +424,10 @@ public class InsertStmt extends DdlStmt {
             // TargeTable's hll column must be hll_hash's result
             if (col.getType().equals(Type.HLL)) {
                 checkHllCompatibility(col, expr);
+            }
+
+            if (col.getAggregationType() == AggregateType.BITMAP_UNION) {
+                checkBitmapCompatibility(col, expr);
             }
 
             if (expr instanceof DefaultValueExpr) {
@@ -478,6 +489,36 @@ public class InsertStmt extends DdlStmt {
         }
     }
 
+    private void checkBitmapCompatibility(Column col, Expr expr) throws AnalysisException {
+        boolean isCompatible = false;
+        final String bitmapMismatchLog = "Column's agg type is bitmap_union,"
+                + " SelectList must contains bitmap_union column, to_bitmap or bitmap_union function's result, column=" + col.getName();
+        if (expr instanceof SlotRef) {
+            final SlotRef slot = (SlotRef) expr;
+            Column column = slot.getDesc().getColumn();
+            if (column != null && column.getAggregationType() == AggregateType.BITMAP_UNION) {
+                isCompatible = true;  // select * from bitmap_table
+            } else if (slot.getDesc().getSourceExprs().size() == 1) {
+                Expr sourceExpr = slot.getDesc().getSourceExprs().get(0);
+                if (sourceExpr instanceof FunctionCallExpr) {
+                    FunctionCallExpr functionExpr = (FunctionCallExpr) sourceExpr;
+                    if (functionExpr.getFnName().getFunction().equalsIgnoreCase(FunctionSet.BITMAP_UNION)) {
+                        isCompatible = true; // select id, bitmap_union(id2) from bitmap_table group by id
+                    }
+                }
+            }
+        } else if (expr instanceof FunctionCallExpr) {
+            final FunctionCallExpr functionExpr = (FunctionCallExpr) expr;
+            if (functionExpr.getFnName().getFunction().equalsIgnoreCase(FunctionSet.TO_BITMAP)) {
+                isCompatible = true; // select id, to_bitmap(id2) from table;
+            }
+        }
+
+        if (!isCompatible) {
+            throw new AnalysisException(bitmapMismatchLog);
+        }
+    }
+
     private Expr checkTypeCompatibility(Column col, Expr expr) throws AnalysisException {
         if (col.getDataType().equals(expr.getType().getPrimitiveType())) {
             return expr;
@@ -500,7 +541,18 @@ public class InsertStmt extends DdlStmt {
             if (exprByName.containsKey(col.getName())) {
                 resultExprs.add(exprByName.get(col.getName()));
             } else {
-                resultExprs.add(checkTypeCompatibility(col, new StringLiteral(col.getDefaultValue())));
+                if (col.getDefaultValue() == null) {
+                    /*
+                    The import stmt has been filtered in function checkColumnCoverage when
+                        the default value of column is null and column is not nullable.
+                    So the default value of column may simply be null when column is nullable
+                     */
+                    Preconditions.checkState(col.isAllowNull());
+                    resultExprs.add(NullLiteral.create(col.getType()));
+                }
+                else {
+                    resultExprs.add(checkTypeCompatibility(col, new StringLiteral(col.getDefaultValue())));
+                }
             }
         }
     }

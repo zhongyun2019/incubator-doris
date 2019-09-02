@@ -55,6 +55,7 @@ import org.apache.doris.task.AgentTaskQueue;
 import org.apache.doris.task.CreateReplicaTask;
 import org.apache.doris.task.DirMoveTask;
 import org.apache.doris.task.DownloadTask;
+import org.apache.doris.task.ReleaseSnapshotTask;
 import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.thrift.TFinishTaskRequest;
 import org.apache.doris.thrift.TStatusCode;
@@ -66,8 +67,10 @@ import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.HashBasedTable;
+import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Multimap;
 import com.google.common.collect.Range;
 import com.google.common.collect.Table.Cell;
 
@@ -754,6 +757,7 @@ public class RestoreJob extends AbstractJob {
         unfinishedSignatureToId.clear();
         taskProgress.clear();
         taskErrMsg.clear();
+        Multimap<Long, Long> bePathsMap = HashMultimap.create();
         batchTask = new AgentBatchTask();
         db.readLock();
         try {
@@ -772,9 +776,17 @@ public class RestoreJob extends AbstractJob {
                         true /* is restore task*/);
                 batchTask.addTask(task);
                 unfinishedSignatureToId.put(signature, tablet.getId());
+                bePathsMap.put(replica.getBackendId(), replica.getPathHash());
             }
         } finally {
             db.readUnlock();
+        }
+        
+        // check disk capacity
+        org.apache.doris.common.Status st = Catalog.getCurrentSystemInfo().checkExceedDiskCapacityLimit(bePathsMap, true);
+        if (!st.ok()) {
+            status = new Status(ErrCode.COMMON_ERROR, st.getErrorMsg());
+            return;
         }
 
         // send tasks
@@ -814,7 +826,7 @@ public class RestoreJob extends AbstractJob {
             MaterializedIndex remoteIdx = remotePart.getIndex(remoteIdxId);
             long localIdxId = localIdxNameToId.get(localidxName);
             remoteIdx.setIdForRestore(localIdxId);
-            if (localIdxId != localTbl.getId()) {
+            if (localIdxId != localTbl.getBaseIndexId()) {
                 // not base table, reset
                 remotePart.deleteRollupIndex(remoteIdxId);
                 remotePart.createRollupIndex(remoteIdx);
@@ -1230,6 +1242,10 @@ public class RestoreJob extends AbstractJob {
         if (!isReplay) {
             restoredPartitions.clear();
             restoredTbls.clear();
+
+            // release snapshot before clearing snapshotInfos
+            releaseSnapshots();
+
             snapshotInfos.clear();
 
             finishedTime = System.currentTimeMillis();
@@ -1240,6 +1256,22 @@ public class RestoreJob extends AbstractJob {
         
         LOG.info("job is finished. is replay: {}. {}", isReplay, this);
         return Status.OK;
+    }
+
+    private void releaseSnapshots() {
+        if (snapshotInfos.isEmpty()) {
+            return;
+        }
+        // we do not care about the release snapshot tasks' success or failure,
+        // the GC thread on BE will sweep the snapshot, finally.
+        AgentBatchTask batchTask = new AgentBatchTask();
+        for (SnapshotInfo info : snapshotInfos.values()) {
+            ReleaseSnapshotTask releaseTask = new ReleaseSnapshotTask(null, info.getBeId(), info.getDbId(),
+                    info.getTabletId(), info.getPath());
+            batchTask.addTask(releaseTask);
+        }
+        AgentTaskExecutor.submit(batchTask);
+        LOG.info("send {} release snapshot tasks, job: {}", snapshotInfos.size(), this);
     }
 
     private void replayWaitingAllTabletsCommitted() {
@@ -1371,6 +1403,9 @@ public class RestoreJob extends AbstractJob {
             // backupMeta is useless
             backupMeta = null;
 
+            releaseSnapshots();
+
+            snapshotInfos.clear();
             RestoreJobState curState = state;
             finishedTime = System.currentTimeMillis();
             state = RestoreJobState.CANCELLED;
